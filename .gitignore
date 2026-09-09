@@ -9,6 +9,8 @@ data/
 audit-current/
 qa/*.png
 qa/*.log
+qa/*.jobid
+qa/seed-*.json
 
 # Local dependency and editor/system artifacts.
 node_modules/
