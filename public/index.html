@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light" />
+  <title>生活管家</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark"><img src="/assets/sprout-logo.png" alt="" /></span>
+        <span class="brand-copy">
+          <strong>生活管家</strong>
+          <small>知行合一，思维建设与管理</small>
+        </span>
+      </div>
+
+      <nav class="primary-nav" id="primaryNav">
+        <button class="nav-item active" data-view="events"><i data-lucide="calendar-check"></i><span>重要时间点</span></button>
+        <button class="nav-item" data-view="principles"><i data-lucide="circle-play"></i><span>原则打卡</span></button>
+        <button class="nav-item" data-view="problems"><i data-lucide="folder-tree"></i><span>问题归纳</span></button>
+        <button class="nav-item" data-view="thoughts"><i data-lucide="message-circle"></i><span>所思</span></button>
+        <button class="nav-item" data-view="plans"><i data-lucide="calendar-days"></i><span>计划</span></button>
+      </nav>
+
+      <div class="sidebar-bottom">
+        <button class="nav-item" data-view="principles" data-open-tab="manage"><i data-lucide="settings"></i><span>设置</span></button>
+        <div class="local-note"><span class="status-dot"></span><span>数据仅保存在本地</span></div>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar" id="topbar"></header>
+      <main id="app" tabindex="-1"></main>
+    </section>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="event-drawer-backdrop hidden" id="eventDrawerRoot"></div>
+  <div class="modal-backdrop hidden" id="modalBackdrop">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <div><p class="eyebrow" id="modalEyebrow">编辑</p><h2 id="modalTitle">编辑内容</h2></div>
+        <button class="icon-button" id="modalClose" aria-label="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions" id="modalActions"></div>
+    </section>
+  </div>
+
+  <dialog class="review-image-viewer" id="reviewImageViewer" aria-label="复盘图片查看器">
+    <div class="review-viewer-bar"><span id="reviewViewerCount"></span><div>
+      <button class="button ghost small" data-action="review-zoom-image" aria-pressed="false">查看原尺寸</button>
+      <button class="icon-button" data-action="review-close-viewer" aria-label="关闭大图"><i data-lucide="x"></i></button>
+    </div></div>
+    <div class="review-viewer-stage" id="reviewViewerStage"><img id="reviewViewerImage" alt="复盘配图" /><p id="reviewViewerError" hidden>图片无法读取，请检查本地图片文件。</p></div>
+    <div class="review-viewer-footer"><button class="icon-button" data-action="review-prev-image" aria-label="上一张"><i data-lucide="chevron-left"></i></button><p id="reviewViewerCaption"></p><button class="icon-button" data-action="review-next-image" aria-label="下一张"><i data-lucide="chevron-right"></i></button></div>
+  </dialog>
+  <script src="/vendor/lucide.min.js"></script>
+  <script src="/event-model.js"></script>
+  <script src="/review-editor.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

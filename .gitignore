@@ -1,0 +1,18 @@
+# Private, local-only background memories.
+public/assets/private/
+
+# User data and automatically-created backups stay only on this computer.
+data/
+
+# Local launchers, review captures and runtime output.
+生活管家.lnk
+audit-current/
+qa/*.png
+qa/*.log
+
+# Local dependency and editor/system artifacts.
+node_modules/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

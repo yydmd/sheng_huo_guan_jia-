@@ -1,0 +1,20 @@
+{
+  "name": "life-steward",
+  "version": "0.1.0",
+  "private": true,
+  "description": "生活管家 —— 执行合一 · 思维建设与管理的本地助手（反思打卡功能）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:no-open": "node server.js --no-open",
+    "test:thoughts": "node qa/thought-v6-api-test.mjs && node qa/cdp-thought-v6-ui-test.mjs",
+    "test:first-round": "node qa/first-round-api-test.mjs && node qa/event-model-test.mjs",
+    "test:principles": "node qa/principles-v10-api-test.mjs && node qa/cdp-principles-stats-ui-test.mjs",
+    "test:event-memos": "node qa/event-memos-test.mjs"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {}
+}
