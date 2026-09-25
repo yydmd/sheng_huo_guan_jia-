@@ -17,15 +17,22 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, exec } = require('child_process');
 
+// 打包版（asar 内）与源码目录中 package.json 均与 server.js 同级
+let APP_VERSION = null;
+try { APP_VERSION = require('./package.json').version || null; } catch (_) { /* 缺失时前端不显示版本 */ }
+
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
+const DATA_DIR = process.env.LIFE_STEWARD_DATA_DIR
+  ? path.resolve(process.env.LIFE_STEWARD_DATA_DIR)
+  : path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const REVIEW_IMAGE_DIR = path.join(DATA_DIR, 'review-images');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const REVIEW_IMAGE_ID = /^[a-f0-9-]{36}\.(png|jpg|webp|gif)$/;
 const BACKUP_ID = /^backup-[0-9]{8}-[0-9]{6}-[a-f0-9-]{36}$/;
 const REVIEW_IMAGE_LIMIT = 10 * 1024 * 1024;
+const THOUGHT_KINDS = ['free', 'review', 'extraction'];
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = parseInt(process.env.PORT || argValue('--port') || '4000', 10);
@@ -40,16 +47,17 @@ function argValue(flag) {
 
 function freshData() {
   return {
-    version: 10,
+    version: 11,
     sections: [],           // 原则（行）
     records: {},            // 打卡记录（按日期）
     checkinReasons: {},     // 未完成原因：{ 'YYYY-MM-DD': { nodeId: '原因' } }
-    thoughtEntries: [],     // 所思文章：[{ id, kind: 'free'|'review', date, title, text, categoryId, createdAt, updatedAt }]
-    thoughtCategories: [],  // 自由思考与每日复盘共用类别：[{ id, name, createdAt }]
+    thoughtEntries: [],     // 所思文章：[{ id, kind: 'free'|'review'|'extraction', date, title, text, categoryId, createdAt, updatedAt }]
+    thoughtCategories: [],  // 文章类别：[{ id, kind: 'free'|'review'|'extraction', name, createdAt }]
     reflectFrameworks: [],  // 所思-反思框架（省）：[{ id, name }]
     reflectEntries: {},     // 所思-反思内容：{ 'YYYY-MM-DD': { frameworkId: 'text' } }
     plans: [],              // 计划：[{ id, name, description, note }]
-    problemTopics: [],      // 问题归纳：[{ id, name, items: [{ id, text }] }]
+    templates: [],          // 个人模板：[{ id, name, content, note }]
+    problems: [],           // 问题拆解：[{ id, name, content, note }]
     events: [],             // 事件安排模板：[{ id, title, note, time, startDate, endDate, repeat, enabled, createdAt, archivedAt }]
     eventCheckins: {},      // 事件完成记录：{ 'eventId@YYYY-MM-DD': { done, completedAt } }
     eventExceptions: [],    // 重复事件例外：[{ eventId, date, type: 'override'|'cancel', changes }]
@@ -174,8 +182,13 @@ function readData() {
     data.reflectFrameworks = Array.isArray(data.reflectFrameworks) ? data.reflectFrameworks : [];
     data.reflectEntries = data.reflectEntries && typeof data.reflectEntries === 'object' ? data.reflectEntries : {};
     data.plans = Array.isArray(data.plans) ? data.plans : [];
-    // v4 兼容：旧数据自动补空问题归纳，不触碰其他字段
-    if (!Array.isArray(data.problemTopics)) data.problemTopics = [];
+    // 个人模板兼容：旧数据自动补空，不触碰其他字段
+    if (!Array.isArray(data.templates)) data.templates = [];
+    // v12 兼容：旧「问题归纳」待迁移（仅当存在旧字段且尚无新字段时转换）
+    const legacyProblemTopics = Array.isArray(data.problemTopics) && !Array.isArray(data.problems)
+      ? data.problemTopics
+      : null;
+    data.problems = Array.isArray(data.problems) ? data.problems : [];
     // v5 兼容：事件安排字段
     if (!Array.isArray(data.events)) data.events = [];
     if (!data.eventCheckins || typeof data.eventCheckins !== 'object') data.eventCheckins = {};
@@ -199,6 +212,25 @@ function readData() {
         });
       }
       delete data.thinkEntries;
+    }
+    if (legacyProblemTopics) {
+      const migrationBackup = `${DATA_FILE}.bak-v12-${Date.now()}`;
+      fs.copyFileSync(DATA_FILE, migrationBackup);
+      // 旧「问题归纳」→ 问题拆解：每个主题转为一条拆解，条目文本逐行合并为内容
+      for (const topic of legacyProblemTopics) {
+        if (!topic || typeof topic !== 'object') continue;
+        const content = (Array.isArray(topic.items) ? topic.items : [])
+          .map((item) => String((item && item.text) ?? ''))
+          .join('\n');
+        data.problems.push({
+          id: typeof topic.id === 'string' && topic.id ? topic.id : newId(),
+          name: String(topic.name || '').trim(),
+          content,
+          note: '',
+        });
+      }
+      delete data.problemTopics;
+      saveData(data); // 迁移立即落盘，后续读取不再重复
     }
     if (typeof data.version !== 'number' || data.version < 8 || legacyThinkEntries) {
       if (!legacyThinkEntries) fs.copyFileSync(DATA_FILE, `${DATA_FILE}.bak-v${data.version || 'old'}-${Date.now()}`);
@@ -227,6 +259,41 @@ function readData() {
         }
       }
       data.version = 10;
+      saveData(data);
+    }
+    if (data.version < 11) {
+      fs.copyFileSync(DATA_FILE, `${DATA_FILE}.bak-v${data.version || 10}-${Date.now()}`);
+      const originalCategories = data.thoughtCategories.slice();
+      const entriesByCategory = new Map();
+      for (const entry of data.thoughtEntries) {
+        if (!entry.categoryId) continue;
+        const kind = THOUGHT_KINDS.includes(entry.kind) ? entry.kind : 'free';
+        if (!entriesByCategory.has(entry.categoryId)) entriesByCategory.set(entry.categoryId, new Set());
+        entriesByCategory.get(entry.categoryId).add(kind);
+      }
+      const kindOrder = ['free', 'review', 'extraction'];
+      const migratedCategories = [];
+      for (const category of originalCategories) {
+        const usedKinds = [...(entriesByCategory.get(category.id) || [])].sort((a, b) => kindOrder.indexOf(a) - kindOrder.indexOf(b));
+        const kinds = usedKinds.length ? usedKinds : ['free'];
+        const idsByKind = new Map();
+        kinds.forEach((kind, index) => {
+          const migrated = { ...category, kind, id: index === 0 ? category.id : newId() };
+          idsByKind.set(kind, migrated.id);
+          migratedCategories.push(migrated);
+        });
+        for (const entry of data.thoughtEntries) {
+          if (entry.categoryId !== category.id) continue;
+          const kind = THOUGHT_KINDS.includes(entry.kind) ? entry.kind : 'free';
+          const migratedId = idsByKind.get(kind);
+          entry.categoryId = migratedId || null;
+        }
+      }
+      data.thoughtCategories = migratedCategories;
+      for (const entry of data.thoughtEntries) {
+        if (entry.categoryId && !data.thoughtCategories.some((category) => category.id === entry.categoryId)) entry.categoryId = null;
+      }
+      data.version = 11;
       saveData(data);
     }
     return data;
@@ -265,6 +332,11 @@ function findThought(data, id) {
 
 function findThoughtCategory(data, id) {
   return data.thoughtCategories.find((category) => category.id === id) || null;
+}
+
+function findThoughtCategoryForKind(data, id, kind) {
+  const category = findThoughtCategory(data, id);
+  return category && category.kind === kind ? category : null;
 }
 
 function normalizeReviewBlocks(blocks) {
@@ -336,15 +408,6 @@ function findCheckinNode(data, id) {
     }
   }
   return null;
-}
-
-function findProblemTopic(data, topicId) {
-  return data.problemTopics.find((t) => t.id === topicId) || null;
-}
-
-function findProblemItem(topic, itemId) {
-  if (!topic || !Array.isArray(topic.items)) return null;
-  return topic.items.find((it) => it.id === itemId) || null;
 }
 
 function toISODateLocal(date) {
@@ -493,6 +556,7 @@ async function handleApi(req, res, pathname) {
       const data = readData();
       return sendJSON(res, 200, {
         version: data.version,
+        appVersion: APP_VERSION,
         sections: data.sections,
         records: data.records,
         checkinReasons: data.checkinReasons,
@@ -501,7 +565,8 @@ async function handleApi(req, res, pathname) {
         reflectFrameworks: data.reflectFrameworks,
         reflectEntries: data.reflectEntries,
         plans: data.plans,
-        problemTopics: data.problemTopics,
+        templates: data.templates,
+        problems: data.problems,
         events: data.events,
         eventCheckins: data.eventCheckins,
         eventExceptions: data.eventExceptions,
@@ -761,13 +826,13 @@ async function handleApi(req, res, pathname) {
       return;
     }
 
-    // ---------- 自由思考 / 每日复盘：文章 ----------
-    // POST /api/thoughts —— 新建文章 { date, kind?: 'free'|'review', title?, text?, categoryId? }
+    // ---------- 自由思考 / 每日复盘 / 思想提取：文章 ----------
+    // POST /api/thoughts —— 新建文章 { date, kind?: 'free'|'review'|'extraction', title?, text?, categoryId? }
     if (method === 'POST' && seg.length === 2 && seg[1] === 'thoughts') {
       const body = await readBody(req);
       if (!isISODate(body.date)) return sendJSON(res, 400, { error: '日期格式错误' });
       const kind = body.kind === undefined ? 'free' : body.kind;
-      if (!['free', 'review'].includes(kind)) return sendJSON(res, 400, { error: '文章类型无效' });
+      if (!THOUGHT_KINDS.includes(kind)) return sendJSON(res, 400, { error: '文章类型无效' });
       const title = String(body.title ?? '');
       if (body.blocks !== undefined && kind !== 'review') return sendJSON(res, 400, { error: '仅每日复盘支持图文内容' });
       const blocks = body.blocks === undefined ? undefined : normalizeReviewBlocks(body.blocks);
@@ -777,6 +842,9 @@ async function handleApi(req, res, pathname) {
       const categoryId = body.categoryId == null || body.categoryId === '' ? null : String(body.categoryId);
       if (categoryId && !findThoughtCategory(data, categoryId)) {
         return sendJSON(res, 400, { error: '所选类别不存在' });
+      }
+      if (categoryId && !findThoughtCategoryForKind(data, categoryId, kind)) {
+        return sendJSON(res, 400, { error: '所选类别不属于当前文章类型' });
       }
       const now = new Date().toISOString();
       const thought = { id: newId(), kind, date: body.date, title, text, categoryId, createdAt: now, updatedAt: now };
@@ -810,6 +878,9 @@ async function handleApi(req, res, pathname) {
         if (categoryId && !findThoughtCategory(data, categoryId)) {
           return sendJSON(res, 400, { error: '所选类别不存在' });
         }
+        if (categoryId && !findThoughtCategoryForKind(data, categoryId, thought.kind)) {
+          return sendJSON(res, 400, { error: '所选类别不属于当前文章类型' });
+        }
         thought.categoryId = categoryId;
       }
       thought.updatedAt = new Date().toISOString();
@@ -826,17 +897,20 @@ async function handleApi(req, res, pathname) {
       return sendJSON(res, 200, { ok: true });
     }
 
-    // ---------- 自由思考：类别 ----------
-    // POST /api/thought-categories —— 新建类别 { name }
+    // ---------- 所思文章类别（按文章类型独立） ----------
+    // POST /api/thought-categories —— 新建类别 { name, kind?: 'free'|'review'|'extraction' }
     if (method === 'POST' && seg.length === 2 && seg[1] === 'thought-categories') {
-      const { name } = await readBody(req);
+      const body = await readBody(req);
+      const { name } = body;
+      const kind = body.kind === undefined ? 'free' : body.kind;
+      if (!THOUGHT_KINDS.includes(kind)) return sendJSON(res, 400, { error: '文章类型无效' });
       const clean = String(name || '').trim();
       if (!clean) return sendJSON(res, 400, { error: '类别名称不能为空' });
       const data = readData();
-      if (data.thoughtCategories.some((entry) => entry.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
+      if (data.thoughtCategories.some((entry) => entry.kind === kind && entry.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
         return sendJSON(res, 409, { error: '类别名称已存在' });
       }
-      const category = { id: newId(), name: clean, createdAt: new Date().toISOString() };
+      const category = { id: newId(), kind, name: clean, createdAt: new Date().toISOString() };
       data.thoughtCategories.push(category);
       saveData(data);
       return sendJSON(res, 201, { category });
@@ -850,7 +924,7 @@ async function handleApi(req, res, pathname) {
       const { name } = await readBody(req);
       const clean = String(name || '').trim();
       if (!clean) return sendJSON(res, 400, { error: '类别名称不能为空' });
-      if (data.thoughtCategories.some((entry) => entry.id !== category.id && entry.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
+      if (data.thoughtCategories.some((entry) => entry.id !== category.id && entry.kind === category.kind && entry.name.toLocaleLowerCase() === clean.toLocaleLowerCase())) {
         return sendJSON(res, 409, { error: '类别名称已存在' });
       }
       category.name = clean;
@@ -1028,79 +1102,118 @@ async function handleApi(req, res, pathname) {
       return sendJSON(res, 200, { ok: true });
     }
 
-    // ---------- 问题归纳：主题 ----------
-    // POST /api/problem-topics —— 新建主题 { name }
-    if (method === 'POST' && seg.length === 2 && seg[1] === 'problem-topics') {
+    // ---------- 个人模板 ----------
+    // POST /api/templates —— 新建模板 { name }
+    if (method === 'POST' && seg.length === 2 && seg[1] === 'templates') {
       const { name } = await readBody(req);
       const clean = String(name || '').trim();
-      if (!clean) return sendJSON(res, 400, { error: '主题名称不能为空' });
+      if (!clean) return sendJSON(res, 400, { error: '模板名称不能为空' });
       const data = readData();
-      const topic = { id: newId(), name: clean, items: [] };
-      data.problemTopics.push(topic);
+      const template = { id: newId(), name: clean, content: '', note: '' };
+      data.templates.push(template);
       saveData(data);
-      return sendJSON(res, 201, { topic });
+      return sendJSON(res, 201, { template });
     }
 
-    // PATCH /api/problem-topics/:topicId —— 重命名主题 { name }
-    if (method === 'PATCH' && seg.length === 3 && seg[1] === 'problem-topics') {
+    // POST /api/templates/reorder —— 模板排序 { orderedIds }
+    if (method === 'POST' && seg.length === 3 && seg[1] === 'templates' && seg[2] === 'reorder') {
+      const { orderedIds } = await readBody(req);
+      if (!Array.isArray(orderedIds)) return sendJSON(res, 400, { error: '参数错误' });
       const data = readData();
-      const topic = findProblemTopic(data, seg[2]);
-      if (!topic) return sendJSON(res, 404, { error: '主题不存在' });
-      const { name } = await readBody(req);
-      const clean = String(name || '').trim();
-      if (!clean) return sendJSON(res, 400, { error: '主题名称不能为空' });
-      topic.name = clean;
+      const map = new Map(data.templates.map((t) => [t.id, t]));
+      const reordered = orderedIds.map((id) => map.get(id)).filter(Boolean);
+      if (reordered.length !== data.templates.length) {
+        return sendJSON(res, 400, { error: '排序列表与模板不一致' });
+      }
+      data.templates = reordered;
       saveData(data);
-      return sendJSON(res, 200, { topic });
+      return sendJSON(res, 200, { templates: data.templates });
     }
 
-    // DELETE /api/problem-topics/:topicId —— 删除主题（连同其问题条目）
-    if (method === 'DELETE' && seg.length === 3 && seg[1] === 'problem-topics') {
+    // PATCH /api/templates/:id —— 更新名称/内容 { name?, content? }
+    if (method === 'PATCH' && seg.length === 3 && seg[1] === 'templates') {
       const data = readData();
-      if (!findProblemTopic(data, seg[2])) return sendJSON(res, 404, { error: '主题不存在' });
-      data.problemTopics = data.problemTopics.filter((t) => t.id !== seg[2]);
+      const template = data.templates.find((t) => t.id === seg[2]);
+      if (!template) return sendJSON(res, 404, { error: '模板不存在' });
+      const body = await readBody(req);
+      if (body.name !== undefined) {
+        const clean = String(body.name).trim();
+        if (!clean) return sendJSON(res, 400, { error: '模板名称不能为空' });
+        template.name = clean;
+      }
+      if (body.content !== undefined) template.content = String(body.content);
+      saveData(data);
+      return sendJSON(res, 200, { template });
+    }
+
+    // POST /api/templates/:id/note —— 保存备注 { note }
+    if (method === 'POST' && seg.length === 4 && seg[1] === 'templates' && seg[3] === 'note') {
+      const data = readData();
+      const template = data.templates.find((t) => t.id === seg[2]);
+      if (!template) return sendJSON(res, 404, { error: '模板不存在' });
+      const { note } = await readBody(req);
+      template.note = String(note ?? '');
+      saveData(data);
+      return sendJSON(res, 200, { saved: true });
+    }
+
+    // DELETE /api/templates/:id —— 删除模板
+    if (method === 'DELETE' && seg.length === 3 && seg[1] === 'templates') {
+      const data = readData();
+      data.templates = data.templates.filter((t) => t.id !== seg[2]);
       saveData(data);
       return sendJSON(res, 200, { ok: true });
     }
 
-    // ---------- 问题归纳：问题条目 ----------
-    // POST /api/problem-topics/:topicId/items —— 新建问题 { text }
-    if (method === 'POST' && seg.length === 4 && seg[1] === 'problem-topics' && seg[3] === 'items') {
+    // ---------- 问题拆解 ----------
+    // POST /api/problems —— 新建问题 { name }
+    if (method === 'POST' && seg.length === 2 && seg[1] === 'problems') {
+      const { name } = await readBody(req);
+      const clean = String(name || '').trim();
+      if (!clean) return sendJSON(res, 400, { error: '问题标题不能为空' });
       const data = readData();
-      const topic = findProblemTopic(data, seg[2]);
-      if (!topic) return sendJSON(res, 404, { error: '主题不存在' });
-      const { text } = await readBody(req);
-      const clean = String(text || '').trim();
-      if (!clean) return sendJSON(res, 400, { error: '问题内容不能为空' });
-      const item = { id: newId(), text: clean };
-      topic.items.push(item);
+      const problem = { id: newId(), name: clean, content: '', note: '' };
+      data.problems.push(problem);
       saveData(data);
-      return sendJSON(res, 201, { item });
+      return sendJSON(res, 201, { problem });
     }
 
-    // PATCH /api/problem-topics/:topicId/items/:itemId —— 编辑问题 { text }
-    if (method === 'PATCH' && seg.length === 5 && seg[1] === 'problem-topics' && seg[3] === 'items') {
+    // POST /api/problems/reorder —— 问题排序 { orderedIds }
+    if (method === 'POST' && seg.length === 3 && seg[1] === 'problems' && seg[2] === 'reorder') {
+      const { orderedIds } = await readBody(req);
+      if (!Array.isArray(orderedIds)) return sendJSON(res, 400, { error: '参数错误' });
       const data = readData();
-      const topic = findProblemTopic(data, seg[2]);
-      const item = findProblemItem(topic, seg[4]);
-      if (!topic) return sendJSON(res, 404, { error: '主题不存在' });
-      if (!item) return sendJSON(res, 404, { error: '问题不存在' });
-      const { text } = await readBody(req);
-      const clean = String(text || '').trim();
-      if (!clean) return sendJSON(res, 400, { error: '问题内容不能为空' });
-      item.text = clean;
+      const map = new Map(data.problems.map((p) => [p.id, p]));
+      const reordered = orderedIds.map((id) => map.get(id)).filter(Boolean);
+      if (reordered.length !== data.problems.length) {
+        return sendJSON(res, 400, { error: '排序列表与问题不一致' });
+      }
+      data.problems = reordered;
       saveData(data);
-      return sendJSON(res, 200, { item });
+      return sendJSON(res, 200, { problems: data.problems });
     }
 
-    // DELETE /api/problem-topics/:topicId/items/:itemId —— 删除问题
-    if (method === 'DELETE' && seg.length === 5 && seg[1] === 'problem-topics' && seg[3] === 'items') {
+    // PATCH /api/problems/:id —— 单请求保存全部字段 { name?, content?, note? }
+    if (method === 'PATCH' && seg.length === 3 && seg[1] === 'problems') {
       const data = readData();
-      const topic = findProblemTopic(data, seg[2]);
-      if (!topic) return sendJSON(res, 404, { error: '主题不存在' });
-      const item = findProblemItem(topic, seg[4]);
-      if (!item) return sendJSON(res, 404, { error: '问题不存在' });
-      topic.items = topic.items.filter((it) => it.id !== seg[4]);
+      const problem = data.problems.find((p) => p.id === seg[2]);
+      if (!problem) return sendJSON(res, 404, { error: '问题不存在' });
+      const body = await readBody(req);
+      if (body.name !== undefined) {
+        const clean = String(body.name).trim();
+        if (!clean) return sendJSON(res, 400, { error: '问题标题不能为空' });
+        problem.name = clean;
+      }
+      if (body.content !== undefined) problem.content = String(body.content);
+      if (body.note !== undefined) problem.note = String(body.note);
+      saveData(data);
+      return sendJSON(res, 200, { problem });
+    }
+
+    // DELETE /api/problems/:id —— 删除问题
+    if (method === 'DELETE' && seg.length === 3 && seg[1] === 'problems') {
+      const data = readData();
+      data.problems = data.problems.filter((p) => p.id !== seg[2]);
       saveData(data);
       return sendJSON(res, 200, { ok: true });
     }
@@ -1233,15 +1346,43 @@ const server = http.createServer((req, res) => {
   serveStatic(res, pathname);
 });
 
-server.listen(PORT, HOST, () => {
-  const url = `http://${HOST}:${PORT}`;
-  console.log('');
-  console.log('  ┌──────────────────────────────────────────────┐');
-  console.log('  │   生活管家 · 本地助手                          │');
-  console.log(`  │   已启动：${url}            │`);
-  console.log('  │   数据文件：./data/data.json                  │');
-  console.log('  │   按 Ctrl+C 停止服务                          │');
-  console.log('  └──────────────────────────────────────────────┘');
-  console.log('');
-  if (!NO_OPEN) openBrowser(url);
-});
+function startServer(options = {}) {
+  const host = options.host || HOST;
+  const port = options.port === undefined ? PORT : options.port;
+  const shouldOpen = options.openBrowser === undefined ? !NO_OPEN : options.openBrowser;
+
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      const address = server.address();
+      const actualPort = address && typeof address === 'object' ? address.port : port;
+      const url = `http://${host}:${actualPort}`;
+      console.log('');
+      console.log('  ┌──────────────────────────────────────────────┐');
+      console.log('  │   生活管家 · 本地助手                          │');
+      console.log(`  │   已启动：${url}`);
+      console.log(`  │   数据文件：${DATA_FILE}`);
+      console.log('  │   按 Ctrl+C 停止服务                          │');
+      console.log('  └──────────────────────────────────────────────┘');
+      console.log('');
+      if (shouldOpen) openBrowser(url);
+      resolve({ server, url });
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
+  });
+}
+
+if (require.main === module) {
+  startServer().catch((error) => {
+    console.error('生活管家启动失败：', error);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { server, startServer };

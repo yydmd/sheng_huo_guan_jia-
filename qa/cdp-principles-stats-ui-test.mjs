@@ -107,7 +107,7 @@ const seed = {
   checkinReasons: {
     [yesterday]: { 'child-incomplete': '没有留出完整时间', 'child-missed': '临时会议打断' },
   },
-  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], problemTopics: [],
+  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], problems: [],
   events: [], eventCheckins: {}, eventExceptions: [],
 };
 

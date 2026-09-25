@@ -22,7 +22,7 @@ const seed = {
   version: 8,
   sections: [{ id: 'section-existing', name: '已有原则', items: [{ id: itemId, name: '已有条目' }] }],
   records: { '2026-08-14': { [itemId]: true } },
-  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: [], plans: [], problemTopics: [],
+  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: [], plans: [], problems: [],
   events: [], eventCheckins: {}, eventExceptions: [],
 };
 
@@ -55,7 +55,7 @@ try {
   await waitForServer();
 
   const migrated = await request('GET', '/api/state');
-  assert.equal(migrated.version, 10, '旧数据应升级为 v10');
+  assert.equal(migrated.version, 11, '旧数据应升级为 v11');
   assert.equal(migrated.sections[0].items[0].activeSince, '2026-08-14', '已有条目应从最早打卡日开始参与统计');
   assert.deepEqual(migrated.sections[0].items[0].children, [], '已有条目应补充空子节点列表');
 

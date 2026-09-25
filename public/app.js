@@ -5,7 +5,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 let state = {
   version: 0,
-  sections: [], records: {}, checkinReasons: {}, thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], problemTopics: [],
+  sections: [], records: {}, checkinReasons: {}, thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], templates: [], problems: [],
   events: [], eventCheckins: {}, eventExceptions: [], backups: [],
 };
 let currentView = 'events';
@@ -18,30 +18,37 @@ let reasonTimelineRange = '30';
 let reasonTimelineQuery = '';
 let reviewHighlightItemId = null;
 let selectedPlanId = null;
+let selectedTemplateId = null;
 let focusItemId = null;
 let toastTimer = null;
 let thinkTimer = null;
 let reflectTimer = null;
 let planTimer = null;
+let templateTimer = null;
 let thoughtMode = 'free';                 // 'free' | 'review' | 'reflection'
 let thoughtSurface = 'history';           // 默认记录列表；'editor' | 'history'
 let selectedHistoryKey = null;            // 历史记录中当前打开的文章/反思 key
 let historyListScroll = { app: 0, window: 0 }; // 从阅读页返回时恢复列表位置
-let thoughtHistoryFilter = 'all';         // 'all' | 'free' | 'review' | 'reflection'
-let thoughtHistoryCategory = 'all';       // 'all' | 'uncategorized' | categoryId
+let thoughtHistoryFilter = 'free';         // 'free' | 'review' | 'reflection' | 'extraction'
+let thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' }; // 每种文章独立记忆类别筛选
 let thoughtHistoryQuery = '';             // 历史搜索关键词
 let selectedThoughtId = null;              // 当前编辑的自由思考 id，'draft' 为临时草稿
 let thoughtDraft = null;                   // 尚未产生有效内容的客户端草稿
 let thoughtSavePromise = null;             // 当前正在提交的自由思考请求
 let reflectSavePromise = null;             // 当前正在提交的每日反思请求
-let planSavePromise = null;                // 当前正在提交的计划请求
+let planSavePromise = null;               // 当前正在提交的计划请求
+let templateSavePromise = null;           // 当前正在提交的模板请求
 let thinkRetry = null;                     // 自由思考保存失败时的完整文章快照
 let reflectRetry = null;                  // 每日反思保存失败时的重试快照
 let planMenuOpenId = null;                // 计划列表“更多”菜单当前打开的计划 id
+let templateMenuOpenId = null;            // 模板列表“更多”菜单当前打开的模板 id
 let planRetry = null;                     // 计划保存失败时的重试快照
-let selectedProblemTopicId = null;        // 问题归纳当前选中的主题 id
-let problemMenuOpenId = null;             // 问题主题“更多”菜单当前打开的主题 id
-let problemMenuAnchor = 'rail';           // 菜单锚点：'rail'（左侧行内）| 'detail'（详情标题区）
+let templateRetry = null;                 // 模板保存失败时的重试快照
+let selectedProblemId = null;              // 问题拆解当前选中的问题 id
+let problemTimer = null;                  // 问题自动保存防抖计时器
+let problemSavePromise = null;            // 当前正在提交的问题请求
+let problemMenuOpenId = null;             // 问题列表“更多”菜单当前打开的问题 id
+let problemRetry = null;                  // 问题保存失败时的重试快照
 let eventDate = localToday();             // 事件安排独立日期（允许过去与未来）
 let eventMode = 'schedule';               // 'schedule' | 'calendar' | 'recurring' | 'memos'
 let eventCalendarCursor = null;           // 月历当前显示的 'YYYY-MM'
@@ -128,6 +135,7 @@ function allNodeContexts() {
   ]));
 }
 function currentPlan() { return state.plans.find((plan) => plan.id === selectedPlanId) || null; }
+function currentTemplate() { return state.templates.find((template) => template.id === selectedTemplateId) || null; }
 
 async function api(method, url, body) {
   const options = { method, headers: {} };
@@ -180,7 +188,8 @@ function renderTopbar() {
     principles: ['原则打卡', '用清楚的原则指导每天的行动。'],
     thoughts: ['所思', '记录想法，也给一天留出复盘的空间。'],
     plans: ['计划', '让长期方向始终落到清楚的下一步。'],
-    problems: ['问题归纳', '把反复出现的问题按主题整理，慢慢看清真正需要解决的事情。'],
+    templates: ['个人模板', '把常用的内容整理成模板，需要时直接取用。'],
+    problems: ['问题拆解', '把大问题拆成小步骤，看清下一步能做什么。'],
   };
   const [title, subtitle] = titles[currentView];
   let tools = '';
@@ -211,6 +220,7 @@ function render() {
   if (currentView === 'principles') renderPrinciples();
   if (currentView === 'thoughts') renderThoughts();
   if (currentView === 'plans') renderPlans();
+  if (currentView === 'templates') renderTemplates();
   if (currentView === 'problems') renderProblems();
   renderIcons();
 }
@@ -816,19 +826,20 @@ function syncClearAnswerButtons() {
 }
 
 function isArticleMode(kind = thoughtMode) {
-  return kind === 'free' || kind === 'review';
+  return kind === 'free' || kind === 'review' || kind === 'extraction';
 }
 
 function thoughtKind(thought) {
-  return thought?.kind === 'review' ? 'review' : 'free';
+  return ['review', 'extraction'].includes(thought?.kind) ? thought.kind : 'free';
 }
 
 function thoughtKindLabel(kind) {
-  return kind === 'review' ? '每日复盘' : kind === 'reflection' ? '每日反思' : '自由思考';
+  return kind === 'review' ? '每日复盘' : kind === 'reflection' ? '每日反思' : kind === 'extraction' ? '思想提取' : '自由思考';
 }
 
 function thoughtNoun(thought) {
-  return thoughtKind(thought) === 'review' ? '复盘' : '思考';
+  const kind = thoughtKind(thought);
+  return kind === 'review' ? '复盘' : kind === 'extraction' ? '提取' : '思考';
 }
 
 function effectiveThoughtTitle(thought) {
@@ -842,6 +853,10 @@ function effectiveThoughtTitle(thought) {
 function thoughtCategoryName(categoryId) {
   if (!categoryId) return '未分类';
   return state.thoughtCategories.find((category) => category.id === categoryId)?.name || '未分类';
+}
+
+function thoughtCategoriesForKind(kind) {
+  return state.thoughtCategories.filter((category) => category.kind === kind);
 }
 
 function thoughtEntriesForDate(date = selectedDate, kind = thoughtMode) {
@@ -879,6 +894,7 @@ function renderThoughtToolbar() {
     <button class="thought-tab ${thoughtMode === 'free' ? 'active' : ''}" role="tab" id="thoughtTabFree" aria-selected="${thoughtMode === 'free'}" aria-controls="thoughtPanel" data-action="switch-thought-mode" data-mode="free">自由思考</button>
     <button class="thought-tab ${thoughtMode === 'review' ? 'active' : ''}" role="tab" id="thoughtTabReview" aria-selected="${thoughtMode === 'review'}" aria-controls="thoughtPanel" data-action="switch-thought-mode" data-mode="review">每日复盘</button>
     <button class="thought-tab ${thoughtMode === 'reflection' ? 'active' : ''}" role="tab" id="thoughtTabReflection" aria-selected="${thoughtMode === 'reflection'}" aria-controls="thoughtPanel" data-action="switch-thought-mode" data-mode="reflection">每日反思</button>
+    <button class="thought-tab ${thoughtMode === 'extraction' ? 'active' : ''}" role="tab" id="thoughtTabExtraction" aria-selected="${thoughtMode === 'extraction'}" aria-controls="thoughtPanel" data-action="switch-thought-mode" data-mode="extraction">思想提取</button>
   </div>`;
 }
 
@@ -890,13 +906,13 @@ function renderFreeThoughtEditor() {
   const thought = currentThought();
   const label = thoughtKindLabel(thoughtMode);
   return `<section class="free-thought-workspace" aria-label="${label}编辑区">
-    ${thought ? renderThoughtEditorCard(thought) : emptyState('notebook-pen', `这一天还没有${label}`, '可以新建一篇，或返回记录列表查看其他文章。', `<button class="button primary small" data-action="${thoughtMode === 'review' ? 'new-review' : 'new-thought'}"><i data-lucide="plus"></i>新建${thoughtMode === 'review' ? '复盘' : '思考'}</button>`)}
+    ${thought ? renderThoughtEditorCard(thought) : emptyState('notebook-pen', `这一天还没有${label}`, '可以新建一篇，或返回记录列表查看其他文章。', `<button class="button primary small" data-action="${thoughtMode === 'review' ? 'new-review' : thoughtMode === 'extraction' ? 'new-extraction' : 'new-thought'}"><i data-lucide="plus"></i>新建${thoughtMode === 'review' ? '复盘' : thoughtMode === 'extraction' ? '提取' : '思考'}</button>`)}
   </section>`;
 }
 
 function renderThoughtEditorCard(thought) {
   const label = thoughtKindLabel(thoughtKind(thought));
-  const options = state.thoughtCategories.map((category) => `<option value="${category.id}" ${thought.categoryId === category.id ? 'selected' : ''}>${escapeHtml(category.name)}</option>`).join('');
+  const options = thoughtCategoriesForKind(thoughtKind(thought)).map((category) => `<option value="${category.id}" ${thought.categoryId === category.id ? 'selected' : ''}>${escapeHtml(category.name)}</option>`).join('');
   return `<div class="free-editor-card" data-thought-id="${escapeHtml(thought.id)}">
     <div class="thought-editor-head">
       <input class="thought-title-input" id="thoughtTitle" value="${escapeHtml(thought.title || '')}" placeholder="输入标题；留空时自动使用正文首行" aria-label="${label}标题" maxlength="160" />
@@ -911,7 +927,7 @@ function renderThoughtEditorCard(thought) {
       </select>
       <button class="button ghost small" data-action="manage-thought-categories"><i data-lucide="settings-2"></i>管理类别</button>
     </div>
-    ${thoughtKind(thought) === 'review' && state.version >= 8 ? renderReviewEditor(thought) : `<textarea class="textarea free-thought" id="thoughtEditor" placeholder="${thoughtKind(thought) === 'review' ? '回顾今天：发生了什么、有哪些收获、明天想怎样改进……' : '此刻在想什么？写下今天的想法、灵感或目标……'}" aria-label="${label}内容">${escapeHtml(thought.text || '')}</textarea>`}
+    ${thoughtKind(thought) === 'review' && state.version >= 8 ? renderReviewEditor(thought) : `<textarea class="textarea free-thought" id="thoughtEditor" placeholder="${thoughtKind(thought) === 'review' ? '回顾今天：发生了什么、有哪些收获、明天想怎样改进……' : thoughtKind(thought) === 'extraction' ? '从文章、对话或笔记里摘出关键思想，写下出处和自己的理解……' : '此刻在想什么？写下今天的想法、灵感或目标……'}" aria-label="${label}内容">${escapeHtml(thought.text || '')}</textarea>`}
     <div class="save-line">
       <span id="thoughtStatus" role="status" aria-live="polite" data-action="retry-think-save">${thought.id === 'draft' ? '开始输入后自动保存' : '仅保存在本地'}</span>
       <span id="thoughtCount">${String(thought.text || '').replace(/\s/g, '').length} 字${thoughtKind(thought) === 'review' ? ` · ${reviewImages(thought).length} 张图片` : ''}</span>
@@ -1017,12 +1033,13 @@ function getReflectionPreview(entries) {
 
 function applyHistoryFilter(records) {
   const query = thoughtHistoryQuery.trim().toLowerCase();
+  const categoryFilter = isArticleMode(thoughtHistoryFilter) ? thoughtHistoryCategory[thoughtHistoryFilter] : 'all';
   return records.filter((record) => {
     if (thoughtHistoryFilter !== 'all' && record.kind !== thoughtHistoryFilter) return false;
-    if (thoughtHistoryCategory !== 'all') {
+    if (categoryFilter !== 'all') {
       if (!isArticleMode(record.kind)) return false;
-      if (thoughtHistoryCategory === 'uncategorized' && record.categoryId) return false;
-      if (thoughtHistoryCategory !== 'uncategorized' && record.categoryId !== thoughtHistoryCategory) return false;
+      if (categoryFilter === 'uncategorized' && record.categoryId) return false;
+      if (categoryFilter !== 'uncategorized' && record.categoryId !== categoryFilter) return false;
     }
     if (query) {
       const haystack = [
@@ -1069,6 +1086,7 @@ function renderThoughtHistoryHeader() {
     <div class="thought-history-actions">
       <button class="button ghost small" data-action="write-daily-reflection"><i data-lucide="pen-line"></i>写每日反思</button>
       <button class="button ghost small" data-action="new-review"><i data-lucide="notebook-pen"></i>新建复盘</button>
+      <button class="button ghost small" data-action="new-extraction"><i data-lucide="highlighter"></i>新建提取</button>
       <button class="button primary small" data-action="new-thought"><i data-lucide="plus"></i>新建思考</button>
     </div>
   </div>`;
@@ -1082,21 +1100,25 @@ function renderThoughtHistory() {
   if (selected) return renderHistoryDetail(selected);
   selectedHistoryKey = null;
 
-  const categoryOptions = state.thoughtCategories.map((category) => `<option value="${category.id}" ${thoughtHistoryCategory === category.id ? 'selected' : ''}>${escapeHtml(category.name)}</option>`).join('');
+  const showCategoryFilter = isArticleMode(thoughtHistoryFilter);
+  const activeCategory = showCategoryFilter ? thoughtHistoryCategory[thoughtHistoryFilter] : 'all';
+  const categoryOptions = showCategoryFilter
+    ? thoughtCategoriesForKind(thoughtHistoryFilter).map((category) => `<option value="${category.id}" ${activeCategory === category.id ? 'selected' : ''}>${escapeHtml(category.name)}</option>`).join('')
+    : '';
   return `<section class="page content-page thoughts-page">
     ${renderThoughtHistoryHeader()}
     <div class="history-filter">
       <div class="history-type-filter" role="group" aria-label="按类型筛选记录">
-        <button class="history-filter-chip ${thoughtHistoryFilter === 'all' ? 'active' : ''}" data-action="filter-thought-history" data-filter="all" aria-pressed="${thoughtHistoryFilter === 'all'}">全部</button>
         <button class="history-filter-chip ${thoughtHistoryFilter === 'free' ? 'active' : ''}" data-action="filter-thought-history" data-filter="free" aria-pressed="${thoughtHistoryFilter === 'free'}">自由思考</button>
         <button class="history-filter-chip ${thoughtHistoryFilter === 'review' ? 'active' : ''}" data-action="filter-thought-history" data-filter="review" aria-pressed="${thoughtHistoryFilter === 'review'}">每日复盘</button>
         <button class="history-filter-chip ${thoughtHistoryFilter === 'reflection' ? 'active' : ''}" data-action="filter-thought-history" data-filter="reflection" aria-pressed="${thoughtHistoryFilter === 'reflection'}">每日反思</button>
+        <button class="history-filter-chip ${thoughtHistoryFilter === 'extraction' ? 'active' : ''}" data-action="filter-thought-history" data-filter="extraction" aria-pressed="${thoughtHistoryFilter === 'extraction'}">思想提取</button>
       </div>
-      <select class="input history-category-filter" id="historyCategoryFilter" aria-label="按文章类别筛选">
-        <option value="all" ${thoughtHistoryCategory === 'all' ? 'selected' : ''}>全部类别</option>
-        <option value="uncategorized" ${thoughtHistoryCategory === 'uncategorized' ? 'selected' : ''}>未分类</option>
+      ${showCategoryFilter ? `<select class="input history-category-filter" id="historyCategoryFilter" aria-label="按${thoughtKindLabel(thoughtHistoryFilter)}类别筛选">
+        <option value="all" ${activeCategory === 'all' ? 'selected' : ''}>全部类别</option>
+        <option value="uncategorized" ${activeCategory === 'uncategorized' ? 'selected' : ''}>未分类</option>
         ${categoryOptions}
-      </select>
+      </select>` : ''}
       <input class="input history-search" id="historySearch" type="search" placeholder="搜索记录……" aria-label="搜索历史记录" value="${escapeHtml(thoughtHistoryQuery)}" />
     </div>
     <div class="thought-history-layout">
@@ -1162,7 +1184,7 @@ function bindHistoryControls() {
     }
   });
   $('#historyCategoryFilter')?.addEventListener('change', (event) => {
-    thoughtHistoryCategory = event.target.value;
+    if (isArticleMode(thoughtHistoryFilter)) thoughtHistoryCategory[thoughtHistoryFilter] = event.target.value;
     selectedHistoryKey = null;
     render();
   });
@@ -1276,142 +1298,172 @@ function syncPlanListRow(planId) {
   if (previewEl) previewEl.textContent = (plan.description || '').trim() || '尚未设置下一步';
 }
 
-// ---------- 问题归纳 ----------
+// ---------- 个人模板 ----------
 
-function currentProblemTopic() {
-  return state.problemTopics.find((topic) => topic.id === selectedProblemTopicId) || null;
+function renderTemplates() {
+  if (!selectedTemplateId && state.templates.length) selectedTemplateId = state.templates[0].id;
+  const template = currentTemplate();
+  $('#app').innerHTML = `<section class="page content-page plans-page">
+    <aside class="plan-rail" aria-label="全部模板">
+      <div class="plan-rail-head">
+        <div class="plan-rail-title"><h2>全部模板</h2><span class="plan-count">${state.templates.length} 个</span></div>
+        <button class="button primary small plan-new" data-action="add-template"><i data-lucide="plus"></i>新建模板</button>
+      </div>
+      <div class="plan-list">
+        ${state.templates.length ? state.templates.map((item, index) => templateListItem(item, index)).join('') : '<p class="status-text plan-empty-hint">还没有模板。</p>'}
+      </div>
+    </aside>
+    <div class="plan-workspace">
+      ${template ? renderTemplateEditor(template) : emptyState('layout-template', '建立第一个模板', '把常用的内容整理成模板，需要时直接取用。', '<button class="button primary" data-action="add-template"><i data-lucide="plus"></i>新建模板</button>')}
+    </div>
+  </section>`;
+  $$('.template-editor').forEach((editor) => editor.addEventListener('input', () => {
+    scheduleTemplateSave();
+    syncTemplateListRow(selectedTemplateId);
+  }));
 }
+
+function templateListItem(item, index) {
+  const open = templateMenuOpenId === item.id;
+  const preview = (item.content || '').trim() || '还没有内容';
+  const active = item.id === selectedTemplateId;
+  return `<div class="plan-list-row ${active ? 'active' : ''}" data-id="${item.id}">
+    <button class="plan-select" data-action="select-template" data-id="${item.id}" aria-label="选择模板「${escapeHtml(item.name)}」">
+      <span class="plan-name">${escapeHtml(item.name || '未命名模板')}</span>
+      <span class="plan-preview">${escapeHtml(preview)}</span>
+    </button>
+    <div class="plan-more-wrap">
+      <button class="plan-more" data-action="open-template-menu" data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名模板')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
+      ${open ? `<div class="plan-menu" data-template-menu role="menu" aria-label="模板操作">
+        <button class="plan-menu-item" role="menuitem" data-action="move-template" data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="move-template" data-id="${item.id}" data-dir="down" ${index === state.templates.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item danger" role="menuitem" data-action="delete-template" data-id="${item.id}"><i data-lucide="trash-2"></i>删除模板</button>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
+function renderTemplateEditor(template) {
+  return `<section class="plan-workspace-panel" aria-label="当前模板编辑器">
+    <div class="plan-title-row">
+      <input class="plan-name-input template-editor" id="templateName" value="${escapeHtml(template.name)}" aria-label="模板名称" placeholder="模板名称" />
+      <span class="plan-save" id="templateStatus" role="status" aria-live="polite" data-action="retry-template-save">已保存</span>
+    </div>
+    <section class="plan-field next-step-field">
+      <div class="plan-field-head">
+        <label for="templateContent">模板内容</label>
+      </div>
+      <textarea class="plan-next-step template-editor" id="templateContent" placeholder="写下这份模板的固定内容，例如周报结构、复盘框架、常用话术……" aria-label="模板内容">${escapeHtml(template.content)}</textarea>
+    </section>
+    <section class="plan-field note-field">
+      <div class="plan-field-head">
+        <label for="templateNote">使用备注</label>
+      </div>
+      <textarea class="plan-note template-editor" id="templateNote" placeholder="记录适用场景、使用方法或维护心得……" aria-label="使用备注">${escapeHtml(template.note)}</textarea>
+    </section>
+  </section>`;
+}
+
+function setTemplateStatus(text, isError = false) {
+  const el = $('#templateStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('save-error', isError);
+}
+
+function syncTemplateListRow(templateId) {
+  const template = state.templates.find((entry) => entry.id === templateId);
+  const row = $(`.plan-list-row[data-id="${templateId}"]`);
+  if (!template || !row) return;
+  const nameEl = row.querySelector('.plan-name');
+  const previewEl = row.querySelector('.plan-preview');
+  if (nameEl) nameEl.textContent = template.name || '未命名模板';
+  if (previewEl) previewEl.textContent = (template.content || '').trim() || '还没有内容';
+}
+
+// ---------- 问题拆解 ----------
+
+function currentProblem() { return state.problems.find((problem) => problem.id === selectedProblemId) || null; }
 
 function renderProblems() {
-  if (!state.problemTopics.length) {
-    selectedProblemTopicId = null;
-    $('#app').innerHTML = `<section class="page content-page problems-page problems-empty">
-      ${emptyState('folder-tree', '还没有问题主题', '先建立一个主题，把反复出现的问题放到一起。', '<button class="button primary" data-action="add-problem-topic"><i data-lucide="plus"></i>建立第一个主题</button>')}
-    </section>`;
-    return;
-  }
-  if (!state.problemTopics.some((topic) => topic.id === selectedProblemTopicId)) {
-    selectedProblemTopicId = state.problemTopics[0].id;
-  }
-  const topic = currentProblemTopic();
-  $('#app').innerHTML = `<section class="page content-page problems-page">
-    <aside class="problem-rail" aria-label="问题主题列表">${renderProblemTopicRail()}</aside>
-    <div class="problem-detail" id="problemDetailWrap">${renderProblemTopicDetail(topic)}</div>
+  if (!selectedProblemId && state.problems.length) selectedProblemId = state.problems[0].id;
+  const problem = currentProblem();
+  $('#app').innerHTML = `<section class="page content-page plans-page">
+    <aside class="plan-rail" aria-label="全部问题">
+      <div class="plan-rail-head">
+        <div class="plan-rail-title"><h2>全部问题</h2><span class="plan-count">${state.problems.length} 个</span></div>
+        <button class="button primary small plan-new" data-action="add-problem"><i data-lucide="plus"></i>新建问题</button>
+      </div>
+      <div class="plan-list">
+        ${state.problems.length ? state.problems.map((item, index) => problemListItem(item, index)).join('') : '<p class="status-text plan-empty-hint">还没有问题。</p>'}
+      </div>
+    </aside>
+    <div class="plan-workspace">
+      ${problem ? renderProblemEditor(problem) : emptyState('folder-tree', '建立第一个问题', '把一个反复出现的大问题写下来，拆成看得清的小步骤。', '<button class="button primary" data-action="add-problem"><i data-lucide="plus"></i>新建问题</button>')}
+    </div>
   </section>`;
-  bindProblemComposer();
+  $$('.problem-editor').forEach((editor) => editor.addEventListener('input', () => {
+    scheduleProblemSave();
+    syncProblemListRow(selectedProblemId);
+  }));
 }
 
-function renderProblemTopicRail() {
-  return `<div class="problem-rail-head">
-    <div class="problem-rail-title"><h2>问题主题</h2><span class="problem-count">${state.problemTopics.length} 个</span></div>
-    <button class="button primary small problem-new" data-action="add-problem-topic"><i data-lucide="plus"></i>新建主题</button>
-  </div>
-  <div class="problem-topic-list" role="list" aria-label="问题主题">
-    ${state.problemTopics.map((topic) => problemTopicRow(topic)).join('')}
-  </div>`;
-}
-
-function problemTopicRow(topic) {
-  const open = problemMenuOpenId === topic.id && problemMenuAnchor === 'rail';
-  const active = topic.id === selectedProblemTopicId;
-  return `<div class="problem-topic-row ${active ? 'active' : ''}" data-id="${topic.id}" role="listitem">
-    <button class="problem-topic-select" data-action="select-problem-topic" data-id="${topic.id}" aria-current="${active ? 'true' : 'false'}" aria-label="选择主题「${escapeHtml(topic.name)}」">
-      <span class="problem-topic-name">${escapeHtml(topic.name)}</span>
-      <span class="problem-topic-meta">${topic.items.length} 个问题</span>
+function problemListItem(item, index) {
+  const open = problemMenuOpenId === item.id;
+  const preview = (item.content || '').trim() || '还没有内容';
+  const active = item.id === selectedProblemId;
+  return `<div class="plan-list-row ${active ? 'active' : ''}" data-id="${item.id}">
+    <button class="plan-select" data-action="select-problem" data-id="${item.id}" aria-label="选择问题「${escapeHtml(item.name)}」">
+      <span class="plan-name">${escapeHtml(item.name || '未命名问题')}</span>
+      <span class="plan-preview">${escapeHtml(preview)}</span>
     </button>
-    <div class="problem-more-wrap">
-      <button class="problem-more" data-action="open-problem-menu" data-anchor="rail" data-id="${topic.id}" aria-label="「${escapeHtml(topic.name)}」的更多操作" aria-expanded="${open}"><i data-lucide="more-horizontal"></i></button>
-      ${open ? problemMenuHtml(topic) : ''}
+    <div class="plan-more-wrap">
+      <button class="plan-more" data-action="open-problem-menu" data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名问题')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
+      ${open ? `<div class="plan-menu" data-problem-menu role="menu" aria-label="问题操作">
+        <button class="plan-menu-item" role="menuitem" data-action="move-problem" data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="move-problem" data-id="${item.id}" data-dir="down" ${index === state.problems.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item danger" role="menuitem" data-action="delete-problem" data-id="${item.id}"><i data-lucide="trash-2"></i>删除问题</button>
+      </div>` : ''}
     </div>
   </div>`;
 }
 
-function problemMenuHtml(topic) {
-  return `<div class="problem-menu" data-problem-menu role="menu" aria-label="主题操作">
-    <button class="problem-menu-item" role="menuitem" data-action="rename-problem-topic" data-id="${topic.id}"><i data-lucide="pencil"></i>重命名主题</button>
-    <button class="problem-menu-item danger" role="menuitem" data-action="delete-problem-topic" data-id="${topic.id}"><i data-lucide="trash-2"></i>删除主题</button>
-  </div>`;
-}
-
-function renderProblemTopicDetail(topic) {
-  const open = problemMenuOpenId === topic.id && problemMenuAnchor === 'detail';
-  return `<div class="problem-detail-head">
-    <div class="problem-detail-title">
-      <h2>${escapeHtml(topic.name)}</h2>
-      <span class="problem-count">${topic.items.length} 个问题</span>
+function renderProblemEditor(problem) {
+  return `<section class="plan-workspace-panel" aria-label="当前问题编辑器">
+    <div class="plan-title-row">
+      <input class="plan-name-input problem-editor" id="problemName" value="${escapeHtml(problem.name)}" aria-label="问题标题" placeholder="问题标题" />
+      <span class="plan-save" id="problemStatus" role="status" aria-live="polite" data-action="retry-problem-save">已保存</span>
     </div>
-    <div class="problem-more-wrap">
-      <button class="problem-more" data-action="open-problem-menu" data-anchor="detail" data-id="${topic.id}" aria-label="「${escapeHtml(topic.name)}」的更多操作" aria-expanded="${open}"><i data-lucide="more-horizontal"></i></button>
-      ${open ? problemMenuHtml(topic) : ''}
-    </div>
-  </div>
-  ${renderProblemComposer()}
-  ${renderProblemItems(topic)}`;
-}
-
-function renderProblemComposer() {
-  return `<section class="problem-composer" aria-label="新增问题">
-    <div class="plan-field-head"><label for="problemComposer">新增问题</label></div>
-    <textarea class="problem-composer-input" id="problemComposer" placeholder="写下一个反复出现、值得继续追问的问题……" aria-label="新增问题"></textarea>
-    <div class="problem-composer-actions">
-      <button class="button primary" data-action="add-problem-item"><i data-lucide="plus"></i>添加问题</button>
-    </div>
+    <section class="plan-field note-field">
+      <div class="plan-field-head">
+        <label for="problemContent">拆解内容</label>
+      </div>
+      <textarea class="plan-note problem-editor" id="problemContent" placeholder="把大问题拆成一个个小步骤，写下下一步能做什么……" aria-label="拆解内容">${escapeHtml(problem.content)}</textarea>
+    </section>
+    <section class="plan-field next-step-field">
+      <div class="plan-field-head">
+        <label for="problemNote">备注</label>
+      </div>
+      <textarea class="plan-next-step problem-editor" id="problemNote" placeholder="记录背景、限制或线索……" aria-label="备注">${escapeHtml(problem.note)}</textarea>
+    </section>
   </section>`;
 }
 
-function renderProblemItems(topic) {
-  if (!topic.items.length) {
-    return `<div class="problem-items-empty">${emptyState('folder-tree', '这个主题还没有问题', '把第一个值得继续思考的问题写下来。')}</div>`;
-  }
-  return `<div class="problem-item-list" role="list" aria-label="问题列表">
-    ${topic.items.map((item, index) => {
-      const snippet = item.text.length > 18 ? `${item.text.slice(0, 18)}…` : item.text;
-      return `<div class="problem-item" role="listitem">
-        <span class="problem-item-index">${String(index + 1).padStart(2, '0')}</span>
-        <p class="problem-item-text">${escapeHtml(item.text)}</p>
-        <div class="problem-item-actions">
-          <button class="mini-button" data-action="edit-problem-item" data-topic="${topic.id}" data-id="${item.id}" aria-label="编辑问题「${escapeHtml(snippet)}」"><i data-lucide="pencil"></i></button>
-          <button class="mini-button danger" data-action="delete-problem-item" data-topic="${topic.id}" data-id="${item.id}" aria-label="删除问题「${escapeHtml(snippet)}」"><i data-lucide="trash-2"></i></button>
-        </div>
-      </div>`;
-    }).join('')}
-  </div>`;
+function setProblemStatus(text, isError = false) {
+  const el = $('#problemStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('save-error', isError);
 }
 
-function bindProblemComposer() {
-  const composer = $('#problemComposer');
-  if (!composer) return;
-  composer.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-      event.preventDefault();
-      addProblemItem(selectedProblemTopicId, composer.value);
-    }
-  });
-}
-
-// 增加/删除问题后局部刷新当前主题详情，不重新请求全部状态
-function renderProblemDetail() {
-  const topic = currentProblemTopic();
-  const wrap = $('#problemDetailWrap');
-  if (!topic || !wrap) return;
-  wrap.innerHTML = renderProblemTopicDetail(topic);
-  const row = $(`.problem-topic-row[data-id="${topic.id}"] .problem-topic-meta`);
-  if (row) row.textContent = `${topic.items.length} 个问题`;
-  bindProblemComposer();
-}
-
-async function addProblemItem(topicId, rawText) {
-  const text = String(rawText || '').trim();
-  if (!text) return;
-  const topic = state.problemTopics.find((entry) => entry.id === topicId);
-  if (!topic) return;
-  try {
-    const result = await api('POST', `/api/problem-topics/${topicId}/items`, { text });
-    topic.items.push(result.item);
-    renderProblemDetail();
-    const composer = $('#problemComposer');
-    if (composer) { composer.value = ''; composer.focus(); }
-  } catch (error) { toast(error.message, true); }
+function syncProblemListRow(problemId) {
+  const problem = state.problems.find((entry) => entry.id === problemId);
+  const row = $(`.plan-list-row[data-id="${problemId}"]`);
+  if (!problem || !row) return;
+  const nameEl = row.querySelector('.plan-name');
+  const previewEl = row.querySelector('.plan-preview');
+  if (nameEl) nameEl.textContent = problem.name || '未命名问题';
+  if (previewEl) previewEl.textContent = (problem.content || '').trim() || '还没有内容';
 }
 
 function collectThoughtSnapshot() {
@@ -1623,6 +1675,93 @@ function schedulePlanSave() {
   }, 650);
 }
 
+function sameTemplateSnapshot(left, right) {
+  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note;
+}
+
+async function persistTemplateSnapshot(rawSnapshot) {
+  if (!rawSnapshot) return true;
+  if (templateSavePromise) await templateSavePromise;
+  const snapshot = { ...rawSnapshot };
+  templateSavePromise = (async () => {
+    try {
+      await Promise.all([
+        api('PATCH', `/api/templates/${snapshot.id}`, { name: snapshot.name, content: snapshot.content }),
+        api('POST', `/api/templates/${snapshot.id}/note`, { note: snapshot.note }),
+      ]);
+      if (selectedTemplateId === snapshot.id) setTemplateStatus(sameTemplateSnapshot(templateRetry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
+      if (sameTemplateSnapshot(templateRetry, snapshot)) templateRetry = null;
+      return true;
+    } catch (error) {
+      if (selectedTemplateId === snapshot.id) setTemplateStatus('保存失败，点击重试', true);
+      toast(error.message, true);
+      return false;
+    } finally {
+      templateSavePromise = null;
+    }
+  })();
+  return templateSavePromise;
+}
+
+function scheduleTemplateSave() {
+  const template = currentTemplate();
+  if (!template) return;
+  template.name = $('#templateName').value.trim() || template.name;
+  template.content = $('#templateContent').value;
+  template.note = $('#templateNote').value;
+  const snapshot = { id: template.id, name: template.name, content: template.content, note: template.note };
+  templateRetry = snapshot;
+  setTemplateStatus('输入中…');
+  clearTimeout(templateTimer);
+  templateTimer = setTimeout(() => {
+    templateTimer = null;
+    if (selectedTemplateId === snapshot.id) setTemplateStatus('正在保存…');
+    persistTemplateSnapshot(snapshot);
+  }, 650);
+}
+
+function sameProblemSnapshot(left, right) {
+  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note;
+}
+
+async function persistProblemSnapshot(rawSnapshot) {
+  if (!rawSnapshot) return true;
+  if (problemSavePromise) await problemSavePromise;
+  const snapshot = { ...rawSnapshot };
+  problemSavePromise = (async () => {
+    try {
+      await api('PATCH', `/api/problems/${snapshot.id}`, { name: snapshot.name, content: snapshot.content, note: snapshot.note });
+      if (selectedProblemId === snapshot.id) setProblemStatus(sameProblemSnapshot(problemRetry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
+      if (sameProblemSnapshot(problemRetry, snapshot)) problemRetry = null;
+      return true;
+    } catch (error) {
+      if (selectedProblemId === snapshot.id) setProblemStatus('保存失败，点击重试', true);
+      toast(error.message, true);
+      return false;
+    } finally {
+      problemSavePromise = null;
+    }
+  })();
+  return problemSavePromise;
+}
+
+function scheduleProblemSave() {
+  const problem = currentProblem();
+  if (!problem) return;
+  problem.name = $('#problemName').value.trim() || problem.name;
+  problem.content = $('#problemContent').value;
+  problem.note = $('#problemNote').value;
+  const snapshot = { id: problem.id, name: problem.name, content: problem.content, note: problem.note };
+  problemRetry = snapshot;
+  setProblemStatus('输入中…');
+  clearTimeout(problemTimer);
+  problemTimer = setTimeout(() => {
+    problemTimer = null;
+    if (selectedProblemId === snapshot.id) setProblemStatus('正在保存…');
+    persistProblemSnapshot(snapshot);
+  }, 650);
+}
+
 async function flushPendingSaves() {
   const thoughtSaved = await flushThoughtSave();
   const reflectSnapshot = reflectRetry;
@@ -1633,7 +1772,15 @@ async function flushPendingSaves() {
   clearTimeout(planTimer);
   planTimer = null;
   const planSaved = planSnapshot ? await persistPlanSnapshot(planSnapshot) : !planSavePromise || await planSavePromise;
-  return thoughtSaved && reflectSaved && planSaved;
+  const templateSnapshot = templateRetry;
+  clearTimeout(templateTimer);
+  templateTimer = null;
+  const templateSaved = templateSnapshot ? await persistTemplateSnapshot(templateSnapshot) : !templateSavePromise || await templateSavePromise;
+  const problemSnapshot = problemRetry;
+  clearTimeout(problemTimer);
+  problemTimer = null;
+  const problemSaved = problemSnapshot ? await persistProblemSnapshot(problemSnapshot) : !problemSavePromise || await problemSavePromise;
+  return thoughtSaved && reflectSaved && planSaved && templateSaved && problemSaved;
 }
 
 function bindManageInputs() {
@@ -1710,10 +1857,12 @@ function openConfirmModal({ title, message, confirmText = '确认删除', onConf
 function closeModal() { $('#modalBackdrop').classList.add('hidden'); }
 
 function openAddThoughtCategoryModal() {
+  const kind = thoughtKind(currentThought() || { kind: thoughtMode });
+  const label = thoughtKindLabel(kind);
   openFormModal({
-    eyebrow: '所思 · 文章类别', title: '新建类别', label: '类别名称', placeholder: '例如：学习、关系、灵感', submitText: '新建类别',
+    eyebrow: `所思 · ${label}类别`, title: '新建类别', label: '类别名称', placeholder: '例如：学习、关系、灵感', submitText: '新建类别',
     onSubmit: async (name) => {
-      const result = await api('POST', '/api/thought-categories', { name });
+      const result = await api('POST', '/api/thought-categories', { name, kind });
       state.thoughtCategories.push(result.category);
       const thought = currentThought();
       if (thought) {
@@ -1726,11 +1875,14 @@ function openAddThoughtCategoryModal() {
 }
 
 function openThoughtCategoryManager() {
-  $('#modalEyebrow').textContent = '自由思考与每日复盘共用类别';
+  const kind = thoughtKind(currentThought() || { kind: thoughtMode });
+  const label = thoughtKindLabel(kind);
+  const categories = thoughtCategoriesForKind(kind);
+  $('#modalEyebrow').textContent = `所思 · ${label}类别`;
   $('#modalTitle').textContent = '管理类别';
   $('#modalBody').innerHTML = `<div class="thought-category-manager">
     <div class="thought-category-row system"><span>未分类</span><small>系统类别</small></div>
-    ${state.thoughtCategories.length ? state.thoughtCategories.map((category) => `<div class="thought-category-row">
+    ${categories.length ? categories.map((category) => `<div class="thought-category-row">
       <span>${escapeHtml(category.name)}</span>
       <div class="row-actions">
         <button class="mini-button" data-action="rename-thought-category" data-id="${category.id}" aria-label="重命名类别${escapeHtml(category.name)}"><i data-lucide="pencil"></i></button>
@@ -1865,8 +2017,8 @@ async function handleAction(button) {
     thoughtSurface = 'history';
     selectedHistoryKey = null;
     historyListScroll = { app: 0, window: 0 };
-    thoughtHistoryFilter = 'all';
-    thoughtHistoryCategory = 'all';
+    thoughtHistoryFilter = 'free';
+    thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' };
     thoughtHistoryQuery = '';
     render();
     $('#app').scrollTop = 0;
@@ -1913,8 +2065,8 @@ async function handleAction(button) {
     return;
   }
   if (action === 'reset-history-filter') {
-    thoughtHistoryFilter = 'all';
-    thoughtHistoryCategory = 'all';
+    thoughtHistoryFilter = 'free';
+    thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' };
     thoughtHistoryQuery = '';
     render();
     return;
@@ -1934,7 +2086,7 @@ async function handleAction(button) {
     await persistReflectSnapshot(snapshot);
     return;
   }
-  if (action === 'new-thought' || action === 'new-review') {
+  if (action === 'new-thought' || action === 'new-review' || action === 'new-extraction') {
     if (action === 'new-review' && state.version < 7) {
       toast('请先重启生活管家服务并刷新页面，以启用每日复盘。现有文章不受影响。', true);
       return;
@@ -1942,7 +2094,7 @@ async function handleAction(button) {
     if (thoughtSurface === 'editor' && isArticleMode() && !(await flushThoughtSave())) return;
     if (thoughtSurface === 'history') selectedDate = localToday();
     thoughtSurface = 'editor';
-    thoughtMode = action === 'new-review' ? 'review' : 'free';
+    thoughtMode = action === 'new-review' ? 'review' : action === 'new-extraction' ? 'extraction' : 'free';
     selectedHistoryKey = null;
     thoughtDraft = { id: 'draft', kind: thoughtMode, date: selectedDate, title: '', text: '', categoryId: null, createdAt: null, updatedAt: null };
     selectedThoughtId = 'draft';
@@ -1962,7 +2114,7 @@ async function handleAction(button) {
   if (action === 'rename-thought-category') {
     const category = state.thoughtCategories.find((entry) => entry.id === button.dataset.id);
     if (!category) return;
-    openFormModal({ eyebrow: '所思 · 文章类别', title: '重命名类别', label: '类别名称', value: category.name, onSubmit: async (name) => {
+    openFormModal({ eyebrow: `所思 · ${thoughtKindLabel(category.kind)}类别`, title: '重命名类别', label: '类别名称', value: category.name, onSubmit: async (name) => {
       const result = await api('PATCH', `/api/thought-categories/${category.id}`, { name });
       category.name = result.category.name;
       render();
@@ -1972,13 +2124,13 @@ async function handleAction(button) {
   if (action === 'delete-thought-category') {
     const category = state.thoughtCategories.find((entry) => entry.id === button.dataset.id);
     if (!category) return;
-    const count = state.thoughtEntries.filter((entry) => entry.categoryId === category.id).length;
+    const count = state.thoughtEntries.filter((entry) => entry.categoryId === category.id && thoughtKind(entry) === category.kind).length;
     openConfirmModal({ title: `删除类别「${category.name}」？`, message: `${count} 篇相关文章会转入“未分类”，文章本身不会删除。`, confirmText: '删除类别', onConfirm: async () => {
       await api('DELETE', `/api/thought-categories/${category.id}`);
       state.thoughtCategories = state.thoughtCategories.filter((entry) => entry.id !== category.id);
       state.thoughtEntries.forEach((entry) => { if (entry.categoryId === category.id) entry.categoryId = null; });
       if (thoughtDraft?.categoryId === category.id) thoughtDraft.categoryId = null;
-      if (thoughtHistoryCategory === category.id) thoughtHistoryCategory = 'uncategorized';
+      if (thoughtHistoryCategory[category.kind] === category.id) thoughtHistoryCategory[category.kind] = 'uncategorized';
       render();
     } });
     return;
@@ -2133,6 +2285,14 @@ async function handleAction(button) {
     if (toggle) toggle.focus();
     return;
   }
+  if (action === 'open-template-menu') {
+    const id = button.dataset.id;
+    templateMenuOpenId = templateMenuOpenId === id ? null : id;
+    render();
+    const toggle = $(`[data-action="open-template-menu"][data-id="${id}"]`);
+    if (toggle) toggle.focus();
+    return;
+  }
   if (action === 'retry-plan-save') {
     const snapshot = planRetry;
     if (!snapshot) return;
@@ -2142,98 +2302,63 @@ async function handleAction(button) {
     await persistPlanSnapshot(snapshot);
     return;
   }
+  if (action === 'retry-template-save') {
+    const snapshot = templateRetry;
+    if (!snapshot) return;
+    setTemplateStatus('正在保存…');
+    clearTimeout(templateTimer);
+    templateTimer = null;
+    await persistTemplateSnapshot(snapshot);
+    return;
+  }
 
-  // ---------- 问题归纳 ----------
-  if (action === 'add-problem-topic') {
-    openFormModal({ eyebrow: '问题归纳', title: '新建主题', label: '主题名称', placeholder: '例如：工作与职业、健康管理、人际关系', submitText: '建立主题', onSubmit: async (name) => {
-      const result = await api('POST', '/api/problem-topics', { name });
-      state.problemTopics.push(result.topic);
-      selectedProblemTopicId = result.topic.id;
+  // ---------- 问题拆解 ----------
+  if (action === 'add-problem') {
+    openFormModal({ eyebrow: '问题拆解', title: '新建问题', label: '问题标题', placeholder: '例如：学习效率低、总是拖延', submitText: '建立问题', onSubmit: async (name) => {
+      const result = await api('POST', '/api/problems', { name });
+      state.problems.push(result.problem);
+      selectedProblemId = result.problem.id;
       problemMenuOpenId = null;
       render();
-      requestAnimationFrame(() => { const composer = $('#problemComposer'); if (composer) composer.focus(); });
+      requestAnimationFrame(() => { const input = $('#problemName'); if (input) input.focus(); });
     } });
     return;
   }
-  if (action === 'select-problem-topic') {
-    selectedProblemTopicId = button.dataset.id;
-    problemMenuOpenId = null;
-    render();
-    return;
-  }
+  if (action === 'select-problem') { selectedProblemId = button.dataset.id; problemMenuOpenId = null; render(); return; }
   if (action === 'open-problem-menu') {
     const id = button.dataset.id;
-    const anchor = button.dataset.anchor || 'rail';
-    if (problemMenuOpenId === id && problemMenuAnchor === anchor) {
-      problemMenuOpenId = null;
-    } else {
-      problemMenuOpenId = id;
-      problemMenuAnchor = anchor;
-    }
+    problemMenuOpenId = problemMenuOpenId === id ? null : id;
     render();
-    const toggle = $(`[data-action="open-problem-menu"][data-anchor="${anchor}"][data-id="${id}"]`);
+    const toggle = $(`[data-action="open-problem-menu"][data-id="${id}"]`);
     if (toggle) toggle.focus();
     return;
   }
-  if (action === 'rename-problem-topic') {
-    const topic = state.problemTopics.find((entry) => entry.id === button.dataset.id);
-    openFormModal({ eyebrow: '问题归纳', title: '重命名主题', label: '主题名称', value: topic.name, submitText: '保存', onSubmit: async (name) => {
-      const result = await api('PATCH', `/api/problem-topics/${topic.id}`, { name });
-      topic.name = result.topic.name;
+  if (action === 'retry-problem-save') {
+    const snapshot = problemRetry;
+    if (!snapshot) return;
+    setProblemStatus('正在保存…');
+    clearTimeout(problemTimer);
+    problemTimer = null;
+    await persistProblemSnapshot(snapshot);
+    return;
+  }
+  if (action === 'move-problem') {
+    problemMenuOpenId = null;
+    await moveEntity(state.problems, button.dataset.id, button.dataset.dir, '/api/problems/reorder', 'problems', (items) => { state.problems = items; }); return;
+  }
+  if (action === 'delete-problem') {
+    const problem = state.problems.find((item) => item.id === button.dataset.id);
+    openConfirmModal({ title: `删除「${problem.name}」？`, message: '问题拆解内容和备注也会一并删除，这个操作无法撤销。', onConfirm: async () => {
+      if (selectedProblemId === problem.id && !(await flushPendingSaves())) throw new Error('问题尚未保存成功，请重试后再删除');
+      const index = state.problems.findIndex((item) => item.id === problem.id);
+      await api('DELETE', `/api/problems/${problem.id}`);
+      if (problemRetry?.id === problem.id) problemRetry = null;
+      state.problems = state.problems.filter((item) => item.id !== problem.id);
+      const nextIndex = Math.min(Math.max(index, 0), state.problems.length - 1);
+      selectedProblemId = state.problems[nextIndex]?.id || null;
       problemMenuOpenId = null;
       render();
     } });
-    return;
-  }
-  if (action === 'delete-problem-topic') {
-    const topic = state.problemTopics.find((entry) => entry.id === button.dataset.id);
-    openConfirmModal({
-      title: `删除「${topic.name}」？`,
-      message: `该主题下的 ${topic.items.length} 个问题也会一起删除，此操作无法撤销。`,
-      confirmText: '删除主题',
-      onConfirm: async () => {
-        const index = state.problemTopics.findIndex((entry) => entry.id === topic.id);
-        await api('DELETE', `/api/problem-topics/${topic.id}`);
-        state.problemTopics = state.problemTopics.filter((entry) => entry.id !== topic.id);
-        if (state.problemTopics.length) {
-          selectedProblemTopicId = state.problemTopics[Math.min(Math.max(index, 0), state.problemTopics.length - 1)].id;
-        } else {
-          selectedProblemTopicId = null;
-        }
-        problemMenuOpenId = null;
-        render();
-      },
-    });
-    return;
-  }
-  if (action === 'add-problem-item') {
-    addProblemItem(selectedProblemTopicId, $('#problemComposer')?.value || '');
-    return;
-  }
-  if (action === 'edit-problem-item') {
-    const topic = state.problemTopics.find((entry) => entry.id === button.dataset.topic);
-    const item = topic.items.find((entry) => entry.id === button.dataset.id);
-    openFormModal({ eyebrow: topic.name, title: '编辑问题', label: '问题内容', value: item.text, placeholder: '写下一个反复出现、值得继续追问的问题……', submitText: '保存', multiline: true, onSubmit: async (text) => {
-      const result = await api('PATCH', `/api/problem-topics/${topic.id}/items/${item.id}`, { text });
-      item.text = result.item.text;
-      renderProblemDetail();
-    } });
-    return;
-  }
-  if (action === 'delete-problem-item') {
-    const topic = state.problemTopics.find((entry) => entry.id === button.dataset.topic);
-    const item = topic.items.find((entry) => entry.id === button.dataset.id);
-    const preview = item.text.length > 16 ? `${item.text.slice(0, 16)}…` : item.text;
-    openConfirmModal({
-      title: '删除这个问题？',
-      message: `「${preview}」将被永久删除。`,
-      confirmText: '删除问题',
-      onConfirm: async () => {
-        await api('DELETE', `/api/problem-topics/${topic.id}/items/${item.id}`);
-        topic.items = topic.items.filter((entry) => entry.id !== item.id);
-        renderProblemDetail();
-      },
-    });
     return;
   }
 
@@ -2372,6 +2497,39 @@ async function handleAction(button) {
       const nextIndex = Math.min(Math.max(index, 0), state.plans.length - 1);
       selectedPlanId = state.plans[nextIndex]?.id || null;
       planMenuOpenId = null;
+      render();
+    } });
+    return;
+  }
+
+  // ---------- 个人模板 ----------
+  if (action === 'add-template') {
+    openFormModal({ eyebrow: '个人模板', title: '新建模板', label: '模板名称', placeholder: '例如：周报框架、复盘提纲、活动清单', submitText: '建立模板', onSubmit: async (name) => {
+      const result = await api('POST', '/api/templates', { name });
+      state.templates.push(result.template);
+      selectedTemplateId = result.template.id;
+      templateMenuOpenId = null;
+      render();
+      requestAnimationFrame(() => { const input = $('#templateName'); if (input) input.focus(); });
+    } });
+    return;
+  }
+  if (action === 'select-template') { selectedTemplateId = button.dataset.id; templateMenuOpenId = null; render(); return; }
+  if (action === 'move-template') {
+    templateMenuOpenId = null;
+    await moveEntity(state.templates, button.dataset.id, button.dataset.dir, '/api/templates/reorder', 'templates', (items) => { state.templates = items; }); return;
+  }
+  if (action === 'delete-template') {
+    const template = state.templates.find((item) => item.id === button.dataset.id);
+    openConfirmModal({ title: `删除「${template.name}」？`, message: '模板内容和备注也会一并删除，这个操作无法撤销。', onConfirm: async () => {
+      if (selectedTemplateId === template.id && !(await flushPendingSaves())) throw new Error('模板尚未保存成功，请重试后再删除');
+      const index = state.templates.findIndex((item) => item.id === template.id);
+      await api('DELETE', `/api/templates/${template.id}`);
+      if (templateRetry?.id === template.id) templateRetry = null;
+      state.templates = state.templates.filter((item) => item.id !== template.id);
+      const nextIndex = Math.min(Math.max(index, 0), state.templates.length - 1);
+      selectedTemplateId = state.templates[nextIndex]?.id || null;
+      templateMenuOpenId = null;
       render();
     } });
   }
@@ -2709,13 +2867,14 @@ async function changeView(view, openTab) {
   if (view === 'thoughts') {
     thoughtSurface = 'history';
     selectedHistoryKey = null;
-    thoughtHistoryFilter = 'all';
-    thoughtHistoryCategory = 'all';
+    thoughtHistoryFilter = 'free';
+    thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' };
     thoughtHistoryQuery = '';
     historyListScroll = { app: 0, window: 0 };
   }
   if (openTab) currentPrincipleTab = openTab;
   planMenuOpenId = null;
+  templateMenuOpenId = null;
   problemMenuOpenId = null;
   eventMenuKey = null;
   render();
@@ -2733,15 +2892,17 @@ function bindGlobalEvents() {
       closeEventDrawer();
       return;
     }
-    if (planMenuOpenId || problemMenuOpenId || eventMenuKey) {
+    if (planMenuOpenId || templateMenuOpenId || problemMenuOpenId || eventMenuKey) {
       const onPlanMenu = event.target.closest('[data-plan-menu]') || event.target.closest('[data-action="open-plan-menu"]');
+      const onTemplateMenu = event.target.closest('[data-template-menu]') || event.target.closest('[data-action="open-template-menu"]');
       const onProblemMenu = event.target.closest('[data-problem-menu]') || event.target.closest('[data-action="open-problem-menu"]');
       const onEventMenu = event.target.closest('[data-event-menu]') || event.target.closest('[data-action="open-event-menu"]');
       let dirty = false;
       if (planMenuOpenId && !onPlanMenu) { planMenuOpenId = null; dirty = true; }
+      if (templateMenuOpenId && !onTemplateMenu) { templateMenuOpenId = null; dirty = true; }
       if (problemMenuOpenId && !onProblemMenu) { problemMenuOpenId = null; dirty = true; }
       if (eventMenuKey && !onEventMenu) { eventMenuKey = null; dirty = true; }
-      if (dirty && (currentView === 'plans' || currentView === 'problems' || currentView === 'events')) render();
+      if (dirty && (currentView === 'plans' || currentView === 'templates' || currentView === 'problems' || currentView === 'events')) render();
     }
     const nav = event.target.closest('[data-view]');
     if (nav) { await changeView(nav.dataset.view, nav.dataset.openTab); return; }
@@ -2800,7 +2961,7 @@ function bindGlobalEvents() {
   document.addEventListener('visibilitychange', saveWhenHidden);
   window.addEventListener('pagehide', () => { void flushPendingSaves(); });
   window.addEventListener('beforeunload', (event) => {
-    if (thinkTimer || thoughtSavePromise || thinkRetry || reviewUploadPromise || reviewUploadFailure || reflectTimer || reflectSavePromise || reflectRetry || planTimer || planSavePromise || planRetry) {
+    if (thinkTimer || thoughtSavePromise || thinkRetry || reviewUploadPromise || reviewUploadFailure || reflectTimer || reflectSavePromise || reflectRetry || planTimer || planSavePromise || planRetry || templateTimer || templateSavePromise || templateRetry || problemTimer || problemSavePromise || problemRetry) {
       void flushPendingSaves();
       event.preventDefault();
       event.returnValue = '';
@@ -2826,13 +2987,18 @@ async function init() {
       reflectFrameworks: result.reflectFrameworks || [],
       reflectEntries: result.reflectEntries || {},
       plans: result.plans || [],
-      problemTopics: result.problemTopics || [],
+      templates: result.templates || [],
+      problems: result.problems || [],
       events: result.events || [],
       eventCheckins: result.eventCheckins || {},
       eventExceptions: result.eventExceptions || [],
       backups: backupResult.backups || [],
     };
     selectedPlanId = state.plans[0]?.id || null;
+    selectedTemplateId = state.templates[0]?.id || null;
+    selectedProblemId = state.problems[0]?.id || null;
+    const localNote = $('#localNoteText');
+    if (localNote && result.appVersion) localNote.textContent = `数据仅保存在本地 · v${result.appVersion}`;
     render();
   } catch (error) {
     $('#app').innerHTML = emptyState('triangle-alert', '数据加载失败', error.message, '<button class="button ghost" onclick="location.reload()">重新加载</button>');

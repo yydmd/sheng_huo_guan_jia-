@@ -121,7 +121,7 @@ try {
     version: 6, sections: [], records: {}, thoughtEntries: [], thoughtCategories: [],
     reflectFrameworks: [{ id: 'qa-reflection', name: '今天学到了什么？' }],
     reflectEntries: { '2026-08-01': { 'qa-reflection': '反思第一行\n\n反思第二行' } },
-    plans: [], problemTopics: [], events: [], eventCheckins: {}, eventExceptions: [],
+    plans: [], problems: [], events: [], eventCheckins: {}, eventExceptions: [],
   }, null, 2));
   server = spawn(process.execPath, ['server.js', '--port', String(appPort), '--no-open'], { cwd: temp, stdio: 'ignore' });
   await waitHttp(`${base}/api/state`);
@@ -144,26 +144,26 @@ try {
     throw new Error(`${error.message} ${JSON.stringify(diagnostic)} JS=${JSON.stringify(errors)}`);
   }
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 1`, '默认显示所有日期的记录');
+  await waitFor(cdp, `document.querySelector('.history-list') === null`, '默认显示自由思考筛选');
   assert.equal(await evaluate(cdp, `document.querySelector('#thoughtEditor') === null`), true);
   assert.equal(await evaluate(cdp, `document.querySelector('#globalDate, .thought-entry-rail') === null`), true, '入口不应限制在当天写作');
-  assert.equal(await evaluate(cdp, `document.querySelector('.history-record').dataset.date`), '2026-08-01');
+  assert.equal(await evaluate(cdp, `document.querySelector('.empty-state') !== null`), true);
   assert.equal(await evaluate(cdp, `document.querySelectorAll('[data-action="new-thought"]').length`), 1);
   assert.equal(await evaluate(cdp, `document.querySelector('[data-action="new-thought"]').classList.contains('small')`), true);
   await evaluate(cdp, `document.querySelector('[data-filter="review"]').click()`);
   assert.equal(await evaluate(cdp, `document.querySelectorAll('.history-record').length`), 0);
   assert.equal(await evaluate(cdp, `document.querySelectorAll('.history-type-filter button').length`), 4, '空复盘列表仍保留四种类型筛选');
-  await evaluate(cdp, `document.querySelector('[data-filter="all"]').click()`);
+  await evaluate(cdp, `document.querySelector('[data-filter="free"]').click()`);
   await evaluate(cdp, `document.querySelector('[data-action="write-daily-reflection"]').click()`);
   await waitFor(cdp, `document.querySelector('.reflect-editor') !== null`, '首页可直接写每日反思');
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelector('.history-list') !== null`, '再次点击所思返回全部记录');
+  await waitFor(cdp, `document.querySelector('.history-filter') !== null`, '再次点击所思返回自由思考筛选');
   await evaluate(cdp, `document.querySelector('[data-action="new-thought"]').click()`);
   await waitFor(cdp, `document.querySelector('#thoughtEditor') !== null`, '从列表新建临时草稿');
   await evaluate(cdp, `document.querySelector('[data-view="events"]').click()`);
   await waitFor(cdp, `document.querySelector('.thoughts-page') === null`, '离开所思');
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelector('.history-list') !== null`, '重进所思默认列表');
+  await waitFor(cdp, `document.querySelector('.history-filter') !== null`, '重进所思默认列表');
   assert.equal((await (await fetch(`${base}/api/state`)).json()).thoughtEntries.length, 0, '打开所思或空白新建不得落盘');
 
   await evaluate(cdp, `document.querySelector('[data-action="new-thought"]').click()`);
@@ -181,7 +181,7 @@ try {
   await waitFor(cdp, `document.querySelector('#modalInput') !== null`, '新建类别弹窗');
   await setValue(cdp, '#modalInput', '学习');
   await evaluate(cdp, `document.querySelector('#modalSubmit').click()`);
-  await waitFor(cdp, `(async () => { const s = await (await fetch('/api/state')).json(); return s.thoughtCategories.length === 1 && s.thoughtEntries[0].categoryId === s.thoughtCategories[0].id; })()`, '类别保存');
+  await waitFor(cdp, `(async () => { const s = await (await fetch('/api/state')).json(); return s.thoughtCategories.length === 1 && s.thoughtCategories[0].kind === 'free' && s.thoughtEntries[0].categoryId === s.thoughtCategories[0].id; })()`, '自由思考类别保存');
 
   await newThoughtFromList(cdp);
   await waitFor(cdp, `document.querySelector('#thoughtTitle').value === ''`, '第二篇草稿');
@@ -197,7 +197,7 @@ try {
   assert.equal((await (await fetch(`${base}/api/state`)).json()).thoughtEntries.length, 2);
 
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 3`, '文章与反思历史列表');
+  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 2`, '自由思考历史列表');
   await screenshot(cdp, 'thoughts-home-desktop.png');
   assert.equal(await evaluate(cdp, `document.querySelector('.history-detail') === null`), true, '列表页不应挤出小型预览栏');
   assert.equal(await evaluate(cdp, `[...document.querySelectorAll('.history-record strong')].some((el) => el.textContent.includes('第二篇自动标题'))`), true);
@@ -249,6 +249,7 @@ try {
   await evaluate(cdp, `document.querySelector('[data-action="open-thought-history"]').click()`);
   await waitFor(cdp, `document.querySelector('.history-filter') !== null`, '再次进入历史');
   await evaluate(cdp, `document.querySelector('[data-filter="reflection"]').click()`);
+  assert.equal(await evaluate(cdp, `document.querySelector('#historyCategoryFilter') === null`), true, '每日反思不应显示文章类别筛选');
   await evaluate(cdp, `document.querySelector('.history-record-main').click()`);
   await waitFor(cdp, `document.querySelector('.history-reading-page .history-qa') !== null`, '每日反思同样宽幅阅读');
   assert.equal(await evaluate(cdp, `document.querySelector('.history-qa p').textContent`), '反思第一行\n\n反思第二行');
@@ -259,7 +260,7 @@ try {
   await reloadPage(cdp);
   await waitFor(cdp, `document.querySelector('#app .page') !== null`, '移动端首页');
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 3`, '移动端也默认全部记录');
+  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 2`, '移动端默认自由思考记录');
   assert.equal(await evaluate(cdp, `document.querySelector('#thoughtEditor') === null`), true);
   await screenshot(cdp, 'thoughts-home-mobile.png');
   await evaluate(cdp, `document.querySelector('.history-record-main[data-key^="thought:"]').click()`);
@@ -296,7 +297,7 @@ try {
   await reloadPage(cdp);
   await waitFor(cdp, `document.querySelector('#app .page') !== null`, '列表位置测试首页');
   await evaluate(cdp, `document.querySelector('[data-view="thoughts"]').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 17`, '完整历史列表');
+  await waitFor(cdp, `document.querySelectorAll('.history-record').length === 16`, '完整自由思考历史列表');
   const listPosition = await evaluate(cdp, `(() => {
     const app = document.querySelector('#app'); app.scrollTop = 400;
     const button = [...document.querySelectorAll('.history-record-main')].find((el) => el.getBoundingClientRect().top > 300);
@@ -362,7 +363,8 @@ try {
   await waitFor(cdp, `document.querySelector('#modalInput') !== null`, '复盘快捷新建类别');
   await setValue(cdp, '#modalInput', '日常成长');
   await evaluate(cdp, `document.querySelector('#modalSubmit').click()`);
-  await waitFor(cdp, `(async () => { const s = await (await fetch('/api/state')).json(); return s.thoughtEntries.find(e => e.id === ${JSON.stringify(firstReview.id)}).categoryId === s.thoughtCategories.find(c => c.name === '日常成长')?.id; })()`, '复盘类别保存');
+  await waitFor(cdp, `(async () => { const s = await (await fetch('/api/state')).json(); return s.thoughtEntries.find(e => e.id === ${JSON.stringify(firstReview.id)}).categoryId === s.thoughtCategories.find(c => c.name === '日常成长' && c.kind === 'review')?.id; })()`, '复盘类别保存');
+  assert.equal(await evaluate(cdp, `([...document.querySelectorAll('#thoughtCategory option')].some((option) => option.textContent === '学习'))`), false, '每日复盘不应显示自由思考类别');
   await evaluate(cdp, `document.querySelector('[data-action="open-thought-history"]').click()`);
   await waitFor(cdp, `document.querySelector('.history-filter') !== null`, '复盘返回记录');
   await evaluate(cdp, `document.querySelector('[data-filter="review"]').click()`);

@@ -451,6 +451,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .history-tag.free { background: var(--jade-soft); color: var(--jade-dark); }
 .history-tag.reflect { background: #edf0f3; color: #55617a; }
 .history-tag.review { background: #eaf0fb; color: #425d85; }
+.history-tag.extraction { background: #f0ecf8; color: #5d4a8a; }
 .history-tag.category { background: #f2eee5; color: #746345; }
 .history-record-date { display: block; margin-top: 7px; color: var(--ink-faint); font-size: 11px; }
 .history-preview { margin: 9px 0 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -519,49 +520,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .plan-next-step:focus { border-color: var(--jade); box-shadow: 0 0 0 4px rgba(11,148,126,.08); }
 .plan-note { width: 100%; min-height: clamp(420px, 55dvh, 720px); resize: vertical; border: 1px solid var(--line-strong); border-radius: 10px; padding: 22px 24px; font-size: 16px; line-height: 1.8; background: var(--surface); color: var(--ink); }
 .plan-note:focus { border-color: var(--jade); box-shadow: 0 0 0 4px rgba(11,148,126,.08); }
-
-/* ---------- 问题归纳 ---------- */
-.problems-page { max-width: 1320px; padding-bottom: 88px; display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 30px; align-items: start; }
-.problems-page.problems-empty { display: block; max-width: 560px; }
-.problem-rail { position: sticky; top: 32px; min-width: 0; }
-.problem-rail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
-.problem-rail-title { display: flex; align-items: baseline; gap: 8px; }
-.problem-rail-title h2 { margin: 0; font-size: 18px; }
-.problem-count { color: var(--ink-faint); font-size: 13px; }
-.problem-topic-list { display: grid; gap: 8px; }
-.problem-topic-row { position: relative; display: flex; align-items: stretch; min-height: 64px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); transition: border .15s, box-shadow .15s; }
-.problem-topic-row:hover { border-color: #b9d8cf; }
-.problem-topic-row.active { background: var(--surface-active); border-color: transparent; box-shadow: inset 3px 0 0 var(--jade); }
-.problem-topic-select { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 3px; padding: 10px 8px 10px 14px; border: 0; background: transparent; text-align: left; cursor: pointer; }
-.problem-topic-name { max-width: 100%; font-size: 15px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.problem-topic-row.active .problem-topic-name { font-weight: 700; }
-.problem-topic-meta { color: var(--ink-faint); font-size: 12px; }
-.problem-more-wrap { position: relative; display: flex; align-items: center; flex: 0 0 auto; }
-.problem-more { width: 44px; height: 44px; margin: 0 4px; border: 0; border-radius: 9px; background: transparent; color: var(--ink-soft); cursor: pointer; display: grid; place-items: center; }
-.problem-more:hover { background: #f3f6f5; color: var(--ink); }
-.problem-more svg { width: 18px; height: 18px; }
-.problem-menu { position: absolute; right: 4px; top: calc(100% + 6px); z-index: 30; min-width: 168px; padding: 5px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); display: grid; gap: 2px; }
-.problem-menu-item { min-height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; font-size: 14px; text-align: left; }
-.problem-menu-item svg { width: 16px; height: 16px; }
-.problem-menu-item:hover { background: #f3f6f5; }
-.problem-menu-item.danger { color: var(--danger); }
-
-.problem-detail { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 34px 36px; }
-.problem-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
-.problem-detail-title h2 { margin: 0; font-size: 24px; letter-spacing: -.02em; }
-.problem-detail-title .problem-count { display: block; margin-top: 6px; }
-.problem-composer { background: var(--surface-soft); border-radius: 12px; padding: 18px; margin-bottom: 24px; }
-.problem-composer .plan-field-head { margin-bottom: 10px; }
-.problem-composer-input { width: 100%; min-height: 92px; max-height: 180px; resize: vertical; border: 1px solid var(--line-strong); border-radius: 10px; padding: 13px 15px; font-size: 15px; line-height: 1.7; background: var(--surface); color: var(--ink); }
-.problem-composer-input:focus { border-color: var(--jade); box-shadow: 0 0 0 4px rgba(11,148,126,.08); }
-.problem-composer-actions { margin-top: 12px; display: flex; justify-content: flex-end; }
-.problem-item-list { display: grid; gap: 12px; }
-.problem-item { display: flex; align-items: flex-start; gap: 14px; min-height: 72px; padding: 18px 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); transition: background .15s; }
-.problem-item:hover { background: #fafcfb; }
-.problem-item-index { flex: 0 0 auto; min-width: 26px; color: var(--ink-faint); font-size: 13px; font-weight: 700; padding-top: 2px; }
-.problem-item-text { flex: 1; min-width: 0; margin: 0; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
-.problem-item-actions { flex: 0 0 auto; display: flex; gap: 7px; }
-.problem-items-empty .empty-state { margin: 26px auto 6px; }
 
 /* ---------- 事件安排 ---------- */
 .events-page { max-width: 1120px; padding-bottom: 88px; }
@@ -757,11 +715,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .plan-list-row { flex: 0 0 auto; min-width: 210px; max-width: 260px; }
   .plan-workspace-panel { padding: 28px; }
   .plan-note { min-height: 360px; }
-  .problems-page { grid-template-columns: 1fr; gap: 0; }
-  .problem-rail { position: static; margin-bottom: 22px; }
-  .problem-topic-list { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 8px; }
-  .problem-topic-row { flex: 0 0 auto; min-width: 200px; max-width: 240px; }
-  .problem-detail { padding: 26px; }
   .history-detail { padding: 30px; min-height: 70vh; }
   .stats-grid { grid-template-columns: 1fr; }
   .heatmap { grid-template-columns: repeat(15, 1fr); }
@@ -829,15 +782,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .next-step-field { padding: 16px; }
   .plan-next-step { min-height: 100px; }
   .plan-note { min-height: 360px; }
-  .problems-page { padding: 22px 18px 48px; }
-  .problem-rail-head { flex-wrap: wrap; }
-  .problem-new { width: 100%; }
-  .problem-detail { padding: 20px; }
-  .problem-composer { padding: 14px; }
-  .problem-composer-actions .button { width: 100%; }
-  .problem-item { flex-wrap: wrap; gap: 10px; }
-  .problem-item-index { padding-top: 0; }
-  .problem-item-actions { width: 100%; justify-content: flex-end; }
   .thought-tab { padding: 0 16px; }
   .free-thought { min-height: 320px; }
   .free-editor-card { padding: 20px; }

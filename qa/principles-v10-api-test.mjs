@@ -18,7 +18,7 @@ const seed = {
   version: 9,
   sections: [{ id: 'section-1', name: '原则', items: [{ id: 'item-1', name: '条目', activeSince: '2026-08-01' }] }],
   records: { '2026-08-14': { 'item-1': true } },
-  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], problemTopics: [],
+  thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], problems: [],
   events: [], eventCheckins: {}, eventExceptions: [],
 };
 
@@ -50,7 +50,7 @@ try {
   await waitForServer();
 
   let state = await request('GET', '/api/state');
-  assert.equal(state.version, 10, 'v9 数据应升级为 v10');
+  assert.equal(state.version, 11, 'v9 数据应升级为 v11');
   assert.deepEqual(state.sections[0].items[0].children, [], '旧条目应补充空子节点列表');
   assert.deepEqual(state.records['2026-08-14'], { 'item-1': true }, '历史父条目打卡应保留');
 

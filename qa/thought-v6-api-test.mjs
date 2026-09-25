@@ -21,7 +21,7 @@ const seed = {
   version: 5,
   sections: [], records: {},
   thinkEntries: { '2026-08-08': legacyText, '2026-08-09': '   ' },
-  reflectFrameworks: [], reflectEntries: {}, plans: [], problemTopics: [],
+  reflectFrameworks: [], reflectEntries: {}, plans: [], problems: [],
   events: [], eventCheckins: {}, eventExceptions: [],
 };
 
@@ -69,7 +69,7 @@ try {
   const migratedId = state.thoughtEntries[0].id;
 
   const diskAfterMigration = JSON.parse(fs.readFileSync(path.join(temp, 'data', 'data.json'), 'utf8'));
-  assert.equal(diskAfterMigration.version, 10);
+  assert.equal(diskAfterMigration.version, 11);
   assert.equal(state.thoughtEntries[0].kind, 'free');
   assert.equal('thinkEntries' in diskAfterMigration, false);
   assert.equal(fs.readdirSync(path.join(temp, 'data')).some((name) => name.startsWith('data.json.bak-v5-')), true, '迁移前应生成 v5 备份');
@@ -107,24 +107,31 @@ try {
   state = await request('GET', '/api/state');
   assert.equal(state.thoughtEntries.some((entry) => entry.id === second.id), false);
 
-  // 每日复盘共用文章 CRUD，但类型与自由思考、每日反思隔离。
+  // 三类文章 CRUD 独立管理类别；每日反思仍使用独立框架。
   assert.equal(first.kind, 'free', '旧调用不传类型仍创建自由思考');
   await assert.rejects(() => request('POST', '/api/thoughts', { date: '2026-08-08', kind: 'reflection', text: '类型无效' }), /400/);
   await assert.rejects(() => request('POST', '/api/thoughts', { date: '2026-08-08', kind: 'review', title: ' ', text: ' ' }), /400/);
-  const sharedCategory = (await request('POST', '/api/thought-categories', { name: '复盘与成长' })).category;
-  const review = (await request('POST', '/api/thoughts', { date: '2026-08-08', kind: 'review', title: '今日复盘', text: '收获\n\n下一步', categoryId: sharedCategory.id })).thought;
+  const freeCategory = (await request('POST', '/api/thought-categories', { name: '复盘与成长', kind: 'free' })).category;
+  const reviewCategory = (await request('POST', '/api/thought-categories', { name: '复盘与成长', kind: 'review' })).category;
+  assert.notEqual(freeCategory.id, reviewCategory.id, '不同文章类型允许同名类别');
+  await assert.rejects(() => request('POST', '/api/thought-categories', { name: '复盘与成长', kind: 'review' }), /409/);
+  const review = (await request('POST', '/api/thoughts', { date: '2026-08-08', kind: 'review', title: '今日复盘', text: '收获\n\n下一步', categoryId: reviewCategory.id })).thought;
   const anotherReview = (await request('POST', '/api/thoughts', { date: '2026-08-08', kind: 'review', text: '第二篇复盘' })).thought;
   assert.notEqual(review.id, anotherReview.id);
-  await request('PATCH', `/api/thoughts/${first.id}`, { categoryId: sharedCategory.id });
+  await request('PATCH', `/api/thoughts/${first.id}`, { categoryId: freeCategory.id });
+  await assert.rejects(() => request('PATCH', `/api/thoughts/${first.id}`, { categoryId: reviewCategory.id }), /400/);
   const savedReview = (await request('PATCH', `/api/thoughts/${review.id}`, { kind: 'review', title: '复盘改名', text: '改进计划' })).thought;
   assert.equal(savedReview.kind, 'review');
   await assert.rejects(() => request('PATCH', `/api/thoughts/${review.id}`, { kind: 'free', text: '不应写入' }), /400/);
   await request('POST', '/api/think', { date: '2026-08-08', text: '兼容更新' });
   await request('POST', '/api/reflect', { date: '2026-08-08', entries: { question: '独立反思' } });
-  await request('DELETE', `/api/thought-categories/${sharedCategory.id}`);
+  await request('DELETE', `/api/thought-categories/${reviewCategory.id}`);
   state = await request('GET', '/api/state');
   assert.equal(state.thoughtEntries.find((entry) => entry.id === review.id).text, '改进计划');
   assert.equal(state.thoughtEntries.find((entry) => entry.id === review.id).categoryId, null);
+  assert.equal(state.thoughtEntries.find((entry) => entry.id === first.id).categoryId, freeCategory.id);
+  await request('DELETE', `/api/thought-categories/${freeCategory.id}`);
+  state = await request('GET', '/api/state');
   assert.equal(state.thoughtEntries.find((entry) => entry.id === first.id).categoryId, null);
   await request('DELETE', `/api/thoughts/${review.id}`);
   state = await request('GET', '/api/state');
@@ -179,7 +186,7 @@ try {
   server = spawn(process.execPath, ['server.js', '--port', String(port), '--no-open'], { cwd: temp, stdio: 'ignore' });
   await waitForServer();
   const upgraded = await request('GET', '/api/state');
-  assert.equal(upgraded.version, 10);
+  assert.equal(upgraded.version, 11);
   assert.deepEqual(upgraded.thoughtEntries, state.thoughtEntries);
   assert.deepEqual(upgraded.reflectEntries, state.reflectEntries);
   const backupName = fs.readdirSync(path.join(temp, 'data')).find((name) => name.startsWith('data.json.bak-v6-'));
@@ -201,6 +208,39 @@ try {
   const v7Backup = fs.readdirSync(path.join(temp, 'data')).find((name) => name.startsWith('data.json.bak-v7-'));
   assert.ok(v7Backup);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(temp, 'data', v7Backup), 'utf8')), v7);
+
+  // v10 -> v11：跨类型类别拆分、未使用类别归入自由思考、无效引用清理。
+  await new Promise((resolve) => { server.once('exit', resolve); server.kill(); });
+  const migrationFixture = {
+    ...upgraded,
+    version: 10,
+    thoughtCategories: [
+      { id: 'shared-category', name: '共享类别', createdAt: '2026-08-01T00:00:00.000Z' },
+      { id: 'unused-category', name: '未使用类别', createdAt: '2026-08-01T00:00:00.000Z' },
+    ],
+    thoughtEntries: [
+      { id: 'migrate-free', kind: 'free', date: '2026-08-01', title: '自由', text: '自由', categoryId: 'shared-category' },
+      { id: 'migrate-review', kind: 'review', date: '2026-08-01', title: '复盘', text: '复盘', categoryId: 'shared-category' },
+      { id: 'migrate-extraction', kind: 'extraction', date: '2026-08-01', title: '提取', text: '提取', categoryId: 'missing-category' },
+    ],
+  };
+  fs.writeFileSync(fixturePath, JSON.stringify(migrationFixture, null, 2));
+  server = spawn(process.execPath, ['server.js', '--port', String(port), '--no-open'], { cwd: temp, stdio: 'ignore' });
+  await waitForServer();
+  const migrated = await request('GET', '/api/state');
+  assert.equal(migrated.version, 11);
+  const sharedCategories = migrated.thoughtCategories.filter((category) => category.name === '共享类别');
+  assert.deepEqual(sharedCategories.map((category) => category.kind).sort(), ['free', 'review']);
+  assert.equal(migrated.thoughtCategories.find((category) => category.name === '未使用类别').kind, 'free');
+  assert.equal(migrated.thoughtEntries.find((entry) => entry.id === 'migrate-free').categoryId, sharedCategories.find((category) => category.kind === 'free').id);
+  assert.equal(migrated.thoughtEntries.find((entry) => entry.id === 'migrate-review').categoryId, sharedCategories.find((category) => category.kind === 'review').id);
+  assert.equal(migrated.thoughtEntries.find((entry) => entry.id === 'migrate-extraction').categoryId, null);
+  assert.ok(fs.readdirSync(path.join(temp, 'data')).some((name) => name.startsWith('data.json.bak-v10-')));
+  const migrationFiles = fs.readdirSync(path.join(temp, 'data'));
+  await new Promise((resolve) => { server.once('exit', resolve); server.kill(); });
+  server = spawn(process.execPath, ['server.js', '--port', String(port), '--no-open'], { cwd: temp, stdio: 'ignore' });
+  await waitForServer();
+  assert.deepEqual(fs.readdirSync(path.join(temp, 'data')), migrationFiles, 'v11 迁移不得在重复启动时重复生成备份');
 
   console.log('PASS thought-v6-api-test');
 } finally {

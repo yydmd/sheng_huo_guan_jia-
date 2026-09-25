@@ -1,6 +1,8 @@
 /**
  * 事件安排模块 · 综合验证脚本（日程/日历/固定安排/抽屉/范围操作/移动端）
  * 用法: node qa/cdp-events-test.mjs
+ * 说明: 脚本自启动 server.js（临时数据目录 + 预置种子），不依赖外部端口、不触碰真实 data/data.json；
+ *       所有日期相关的构造与断言均由运行日动态推导，可在任意日期运行。
  */
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -9,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dirname, '..');
 const OUT = path.join(__dirname, '..', 'qa');
 const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const DEBUG_PORT = 9340;
@@ -17,7 +20,41 @@ const API = 'http://127.0.0.1:4000';
 const failures = [];
 const consoleErrors = [];
 let chrome = null;
+let server = null;
+let dataDir = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- 运行日动态日期：所有构造与断言均由运行日推导，不再依赖固定测试日 ----
+const pad2 = (n) => String(n).padStart(2, '0');
+const fmtDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const RUN = new Date();
+const RUN_ISO = fmtDate(RUN);                                        // 运行日
+const RUN_DAY = RUN.getDate();                                       // 运行日的日号（每月第 N 日事件的默认日）
+const RUN_YEAR = RUN.getFullYear();
+const RUN_MONTH = RUN.getMonth();                                    // 0-based
+const RUN_WD = RUN.getDay();                                         // 0-6，5=周五
+const MONTH_LAST_ISO = fmtDate(new Date(RUN_YEAR, RUN_MONTH + 1, 0)); // 运行日所在月最后一天
+const MONTH_LAST_WD = new Date(RUN_YEAR, RUN_MONTH + 1, 0).getDay();
+const IS_MONTH_END = RUN_ISO === MONTH_LAST_ISO;
+const CAL_TITLE = `${RUN_YEAR}年${RUN_MONTH + 1}月`;
+const TODAY_COUNT_BASE = 3 + (RUN_WD === 5 ? 1 : 0);                 // 晨间+和父母+每月N日(+周五的每周复盘)
+const MONTH_LAST_COUNT = 2 + (MONTH_LAST_WD === 5 ? 1 : 0) + (IS_MONTH_END ? 2 : 0); // 晨间+月末(+周五+运行日恰为月末时的另外两条)
+function addDays(iso, n) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return fmtDate(new Date(y, m - 1, d + n));
+}
+function nextWeekday(fromIso, targetWd, { strictlyAfter = false } = {}) {
+  const [y, m, d] = fromIso.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  let diff = (targetWd - date.getDay() + 7) % 7;
+  if (strictlyAfter && diff === 0) diff = 7;
+  date.setDate(date.getDate() + diff);
+  return fmtDate(date);
+}
+const FRIDAY_ISO = nextWeekday(RUN_ISO, 5, { strictlyAfter: true });  // 运行日之后的第一个周五
+const SATURDAY_ISO = addDays(FRIDAY_ISO, 1);                          // 其后的周六
+const FRIDAY2_ISO = addDays(FRIDAY_ISO, 7);                           // 下周五
+const FRIDAY3_ISO = addDays(FRIDAY_ISO, 14);                          // 再下周五
 
 async function waitForHttp(url, timeout = 15000) {
   const start = Date.now();
@@ -114,6 +151,24 @@ async function click(cdp, expr) {
 }
 
 async function main() {
+  // 自启动测试服务：临时数据目录 + 预置种子（含原则/计划/问题数据，验证事件模块不污染其他模块）
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-events-data-'));
+  const seed = {
+    version: 11,
+    sections: [{ id: 'sec-qa', name: '原则', items: [] }],
+    records: {}, checkinReasons: {},
+    thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {},
+    plans: [{ id: 'plan-qa', name: 'QA 计划', description: '', note: '' }],
+    templates: [],
+    problems: [{ id: 'problem-qa', name: 'QA 问题', content: '', note: '' }],
+    events: [], eventCheckins: {}, eventExceptions: [],
+  };
+  fs.writeFileSync(path.join(dataDir, 'data.json'), JSON.stringify(seed, null, 2), 'utf8');
+  server = spawn(process.execPath, ['server.js', '--port', '4000', '--no-open'], {
+    cwd: ROOT, env: { ...process.env, LIFE_STEWARD_DATA_DIR: dataDir }, stdio: 'ignore',
+  });
+  await waitForHttp(`${API}/api/state`);
+
   fs.mkdirSync(OUT, { recursive: true });
   const profile = path.join(os.tmpdir(), `dsh-events-test-${Date.now()}`);
   chrome = spawn(CHROME, [
@@ -195,7 +250,7 @@ async function main() {
   check('完成状态按日独立（今天未完成）', await evaluate(cdp, `document.querySelectorAll('.event-row.done').length === 0`));
 
   console.log('===== 5. 每周与每月重复 =====');
-  // 每周五事件（今天 8/14 周五）
+  // 每周五事件（运行日是否为周五由动态断言覆盖）
   await click(cdp, `document.querySelector('[data-action="open-event-drawer"]').click()`);
   await waitFor(cdp, `document.querySelector('#eventTitleInput') !== null`, 5000, '抽屉3');
   await setInputValue(cdp, '#eventTitleInput', '每周复盘');
@@ -204,16 +259,18 @@ async function main() {
   await waitFor(cdp, `document.querySelector('#eventWeekdaysField') && !document.querySelector('#eventWeekdaysField').classList.contains('hidden')`, 5000, '星期选择');
   await click(cdp, `document.querySelector('.weekday-btn[data-weekday="5"]').click()`);
   await click(cdp, `document.querySelector('#eventDrawerSave').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.event-row').length === 3`, 8000, '每周事件');
-  // 每月 14 日事件
+  const todayCountWithWeekly = 2 + (RUN_WD === 5 ? 1 : 0); // 晨间阅读+和父母通话（+运行日为周五时的每周复盘）
+  await waitFor(cdp, `document.querySelectorAll('.event-row').length === ${todayCountWithWeekly}`, 8000, '每周事件');
+  check(`运行日${RUN_WD === 5 ? '是' : '不是'}周五，每周复盘${RUN_WD === 5 ? '' : '不'}出现在今天`, await evaluate(cdp, `document.querySelectorAll('.event-row').length === ${todayCountWithWeekly}`));
+  // 每月固定日事件（抽屉默认「每月第 N 日」= 运行日的日号）
   await click(cdp, `document.querySelector('[data-action="open-event-drawer"]').click()`);
   await waitFor(cdp, `document.querySelector('#eventTitleInput') !== null`, 5000, '抽屉4');
   await setInputValue(cdp, '#eventTitleInput', '整理账单');
   await setSelect(cdp, '#eventRepeatSelect', 'monthly');
   await waitFor(cdp, `document.querySelector('#eventMonthlyField') && !document.querySelector('#eventMonthlyField').classList.contains('hidden')`, 5000, '每月规则');
   await click(cdp, `document.querySelector('#eventDrawerSave').click()`);
-  await waitFor(cdp, `document.querySelectorAll('.event-row').length === 4`, 8000, '每月事件');
-  check('今天（14日）有 4 个事件', await evaluate(cdp, `document.querySelectorAll('.event-row').length === 4`));
+  await waitFor(cdp, `document.querySelectorAll('.event-row').length === ${TODAY_COUNT_BASE}`, 8000, '每月事件');
+  check(`今天（${RUN_DAY}日）有 ${TODAY_COUNT_BASE} 个事件`, await evaluate(cdp, `document.querySelectorAll('.event-row').length === ${TODAY_COUNT_BASE}`));
   // 每月最后一天事件
   await click(cdp, `document.querySelector('[data-action="open-event-drawer"]').click()`);
   await waitFor(cdp, `document.querySelector('#eventTitleInput') !== null`, 5000, '抽屉5');
@@ -225,53 +282,59 @@ async function main() {
   check('每月最后一天预览', lastDayPreview.includes('每月最后一天'), lastDayPreview);
   await click(cdp, `document.querySelector('#eventDrawerSave').click()`);
   await sleep(600);
-  check('今天（非月末）不出现月末事件', await evaluate(cdp, `document.querySelectorAll('.event-row').length === 4`));
-  // 跳到 8/31：应出现 5 个（每天+每周五? 8/31 是周一，每周五不出现 → 每天+每月14日不出现+月末=2？8/31: 晨间阅读(每天)+月末结账(月末) = 2）
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-31'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
-  await waitFor(cdp, `document.querySelectorAll('.event-row').length === 2`, 8000, '8月31日');
-  const aug31 = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
-  check('8/31 出现每天+月末事件', aug31.includes('晨间阅读') && aug31.includes('月末结账') && !aug31.includes('整理账单') && !aug31.includes('每周复盘'), JSON.stringify(aug31));
-  // 8/21（周五）每周复盘出现
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-21'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
-  await waitFor(cdp, `document.querySelectorAll('.event-row').length >= 1`, 8000, '8月21日');
-  const aug21 = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
-  check('8/21（周五）出现每周复盘', aug21.includes('每周复盘'), JSON.stringify(aug21));
-  // 8/22（周六）每周复盘不出现
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-22'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  check(`今天（${IS_MONTH_END ? '月末' : '非月末'}）${IS_MONTH_END ? '出现' : '不出现'}月末事件`, await evaluate(cdp, `document.querySelectorAll('.event-row').length === ${TODAY_COUNT_BASE + (IS_MONTH_END ? 1 : 0)}`));
+  // 跳到运行日所在月最后一天：每天 + 月末事件必出现，其余按规则动态推导
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${MONTH_LAST_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  await waitFor(cdp, `document.querySelectorAll('.event-row').length === ${MONTH_LAST_COUNT}`, 8000, '月末日程');
+  const monthLastTitles = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
+  check('月末出现每天+月末事件（其余按规则）', monthLastTitles.includes('晨间阅读') && monthLastTitles.includes('月末结账')
+    && monthLastTitles.includes('整理账单') === IS_MONTH_END
+    && monthLastTitles.includes('和父母通话') === IS_MONTH_END
+    && monthLastTitles.includes('每周复盘') === (MONTH_LAST_WD === 5), JSON.stringify(monthLastTitles));
+  // 下一个周五（每周复盘出现）
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${FRIDAY_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  await waitFor(cdp, `document.querySelectorAll('.event-row').length >= 1`, 8000, '周五日程');
+  const fridayTitles = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
+  check('周五出现每周复盘', fridayTitles.includes('每周复盘'), JSON.stringify(fridayTitles));
+  // 其后的周六（每周复盘不出现）
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${SATURDAY_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
   await sleep(600);
-  const aug22 = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
-  check('8/22（周六）无每周复盘', !aug22.includes('每周复盘'), JSON.stringify(aug22));
+  const saturdayTitles = await evaluate(cdp, `[...document.querySelectorAll('.event-title')].map((e) => e.textContent)`);
+  check('周六无每周复盘', !saturdayTitles.includes('每周复盘'), JSON.stringify(saturdayTitles));
   await shot(cdp, 'ev-02-schedule.png');
 
   console.log('===== 6. 日历视图 =====');
+  // 先跳回运行日所在月的月末，确保月历当前显示运行日所在月
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${MONTH_LAST_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  await sleep(300);
   await click(cdp, `document.querySelector('[data-action="event-mode"][data-mode="calendar"]').click()`);
   await waitFor(cdp, `document.querySelector('.event-calendar-grid') !== null`, 8000, '月历');
   const cal = await evaluate(cdp, `
     (() => {
       const cells = [...document.querySelectorAll('.event-cal-cell')];
-      const aug14 = cells.find((c) => c.dataset.date === '2026-08-14');
-      const aug31 = cells.find((c) => c.dataset.date === '2026-08-31');
+      const runCell = cells.find((c) => c.dataset.date === '${RUN_ISO}');
+      const lastCell = cells.find((c) => c.dataset.date === '${MONTH_LAST_ISO}');
       return {
         total: cells.length,
         title: document.querySelector('#eventsCalendarTitle')?.textContent,
-        aug14Count: aug14?.querySelector('.event-cal-count')?.textContent,
-        aug14Dots: aug14?.querySelector('.event-cal-dots')?.textContent || '',
-        aug31Count: aug31?.querySelector('.event-cal-count')?.textContent,
+        runCount: runCell?.querySelector('.event-cal-count')?.textContent,
+        runDots: runCell?.querySelector('.event-cal-dots')?.textContent || '',
+        lastCount: lastCell?.querySelector('.event-cal-count')?.textContent,
         todayMarked: cells.find((c) => c.classList.contains('today'))?.dataset.date,
       };
     })()
   `);
   console.log('  月历:', JSON.stringify(cal));
-  check('月历 42 格且标题为 2026年8月', cal.total === 42 && cal.title === '2026年8月', JSON.stringify(cal));
-  check('8/14 显示 4 项事件计数', cal.aug14Count === '0/4', JSON.stringify(cal.aug14Count));
-  check('8/14 显示圆点', cal.aug14Dots.includes('●'));
-  check('8/31 显示 2 项', cal.aug31Count === '0/2', JSON.stringify(cal.aug31Count));
+  check(`月历 42 格且标题为 ${CAL_TITLE}`, cal.total === 42 && cal.title === CAL_TITLE, JSON.stringify(cal));
+  check(`运行日（${RUN_ISO}）显示 ${TODAY_COUNT_BASE + (IS_MONTH_END ? 1 : 0)} 项事件计数`, cal.runCount === `0/${TODAY_COUNT_BASE + (IS_MONTH_END ? 1 : 0)}`, JSON.stringify(cal.runCount));
+  check('运行日显示圆点', cal.runDots.includes('●'));
+  check(`月末（${MONTH_LAST_ISO}）显示 ${MONTH_LAST_COUNT} 项`, cal.lastCount === `0/${MONTH_LAST_COUNT}`, JSON.stringify(cal.lastCount));
   check('今天有标记', cal.todayMarked !== undefined);
   await shot(cdp, 'ev-03-calendar.png');
-  // 点击 8/31 → 切回日程
-  await click(cdp, `document.querySelector('.event-cal-cell[data-date="2026-08-31"]').click()`);
+  // 点击月末日期 → 切回日程
+  await click(cdp, `document.querySelector('.event-cal-cell[data-date="${MONTH_LAST_ISO}"]').click()`);
   await waitFor(cdp, `document.querySelector('.events-list') !== null`, 8000, '回到日程');
-  check('点击月历日期切回日程并更新日期', await evaluate(cdp, `document.querySelector('#eventsDateTitle')?.textContent.includes('2026-08-31') && document.querySelector('[data-action="event-mode"][data-mode="schedule"]')?.classList.contains('active')`));
+  check('点击月历日期切回日程并更新日期', await evaluate(cdp, `document.querySelector('#eventsDateTitle')?.textContent.includes('${MONTH_LAST_ISO}') && document.querySelector('[data-action="event-mode"][data-mode="schedule"]')?.classList.contains('active')`));
 
   console.log('===== 7. 固定安排管理 =====');
   await click(cdp, `document.querySelector('[data-action="event-mode"][data-mode="recurring"]').click()`);
@@ -283,7 +346,7 @@ async function main() {
     })()
   `);
   console.log('  固定安排:', JSON.stringify(rec));
-  check('固定安排含每天/每周/每月模板', rec.some((r) => r.meta.includes('每天')) && rec.some((r) => r.meta.includes('每周五')) && rec.some((r) => r.meta.includes('每月14日')) && rec.some((r) => r.meta.includes('每月最后一天')), JSON.stringify(rec));
+  check('固定安排含每天/每周/每月模板', rec.some((r) => r.meta.includes('每天')) && rec.some((r) => r.meta.includes('每周五')) && rec.some((r) => r.meta.includes(`每月${RUN_DAY}日`)) && rec.some((r) => r.meta.includes('每月最后一天')), JSON.stringify(rec));
   // 筛选：每天
   await click(cdp, `document.querySelector('[data-action="event-recurring-filter"][data-filter="daily"]').click()`);
   await waitFor(cdp, `document.querySelectorAll('.recurring-row').length === 1`, 8000, '筛选每天');
@@ -307,9 +370,9 @@ async function main() {
   console.log('===== 8. 编辑范围（仅本次） =====');
   await click(cdp, `document.querySelector('[data-action="event-mode"][data-mode="schedule"]').click()`);
   await waitFor(cdp, `document.querySelector('.events-list') !== null`, 8000, '日程3');
-  // 切到 8/21（每周复盘出现）
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-21'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
-  await waitFor(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`, 8000, '8月21日');
+  // 切到下一个周五（每周复盘出现）
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${FRIDAY_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  await waitFor(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`, 8000, '周五日程');
   const wkKey = await evaluate(cdp, `[...document.querySelectorAll('.event-row')].find((r) => r.querySelector('.event-title')?.textContent === '每周复盘').dataset.key`);
   await click(cdp, `document.querySelector('.event-row[data-key="${wkKey}"] [data-action="open-event-menu"]').click()`);
   await waitFor(cdp, `document.querySelector('.event-menu') !== null`, 5000, '事件菜单');
@@ -324,14 +387,14 @@ async function main() {
   await sleep(1500);
   await waitFor(cdp, `document.body.innerText.includes('提前复盘')`, 8000, '例外生效');
   check('仅本次修改生效（当日标题变为提前复盘）', await evaluate(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '提前复盘')`));
-  // 8/28（下周五）仍是每周复盘
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-28'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  // 下下个周五仍是每周复盘
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${FRIDAY2_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
   await sleep(700);
   check('其他日期不受影响（仍为每周复盘）', await evaluate(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘') && ![...document.querySelectorAll('.event-title')].some((e) => e.textContent === '提前复盘')`));
 
   console.log('===== 9. 删除范围（仅删除这一次） =====');
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-08-28'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
-  await waitFor(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`, 8000, '8月28日');
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${FRIDAY2_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  await waitFor(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`, 8000, '下周五');
   const wkKey28 = await evaluate(cdp, `[...document.querySelectorAll('.event-row')].find((r) => r.querySelector('.event-title')?.textContent === '每周复盘').dataset.key`);
   await click(cdp, `document.querySelector('.event-row[data-key="${wkKey28}"] [data-action="open-event-menu"]').click()`);
   await waitFor(cdp, `document.querySelector('.event-menu') !== null`, 5000, '菜单2');
@@ -342,8 +405,8 @@ async function main() {
   await click(cdp, `document.querySelector('#modalSubmit').click()`);
   await waitFor(cdp, `![...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`, 8000, '删除本次');
   check('仅删除这一次成功', true);
-  // 9/4（周五）仍出现每周复盘
-  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '2026-09-04'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
+  // 再下个周五（周五）仍出现每周复盘
+  await evaluate(cdp, `document.querySelector('#eventDateInput').value = '${FRIDAY3_ISO}'; document.querySelector('#eventDateInput').dispatchEvent(new Event('change', { bubbles: true }))`);
   await sleep(700);
   check('未来日期每周复盘仍在', await evaluate(cdp, `[...document.querySelectorAll('.event-title')].some((e) => e.textContent === '每周复盘')`));
 
@@ -363,11 +426,11 @@ async function main() {
   await shot(cdp, 'ev-05-mobile.png');
 
   console.log('\n===== 11. 持久化与数据完整性 =====');
-  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'data.json'), 'utf8'));
+  const raw = JSON.parse(fs.readFileSync(path.join(dataDir, 'data.json'), 'utf8'));
   check('events 已持久化（≥4 条）', Array.isArray(raw.events) && raw.events.length >= 4, `count=${raw.events.length}`);
   check('eventCheckins 已持久化', Object.keys(raw.eventCheckins || {}).length >= 1, JSON.stringify(Object.keys(raw.eventCheckins || {})));
   check('eventExceptions 已持久化（override + cancel）', (raw.eventExceptions || []).filter((e) => e.type === 'override').length >= 1 && (raw.eventExceptions || []).filter((e) => e.type === 'cancel').length >= 1, JSON.stringify(raw.eventExceptions));
-  check('原则/计划/问题数据未被污染', raw.sections?.length >= 1 && raw.plans?.length >= 1 && Array.isArray(raw.problemTopics), JSON.stringify({ s: raw.sections?.length, p: raw.plans?.length }));
+  check('原则/计划/问题数据未被污染', raw.sections?.length >= 1 && raw.plans?.length >= 1 && Array.isArray(raw.problems), JSON.stringify({ s: raw.sections?.length, p: raw.plans?.length }));
   const st = await (await fetch(`${API}/api/state`)).json();
   check('原则打卡 records 未受影响', st.records && typeof st.records === 'object', JSON.stringify(Object.keys(st.records || {})));
   check('api/state 返回三个事件字段', Array.isArray(st.events) && typeof st.eventCheckins === 'object' && Array.isArray(st.eventExceptions));
@@ -384,6 +447,9 @@ async function main() {
   chrome.kill();
   await sleep(800);
   fs.rmSync(profile, { recursive: true, force: true });
+  if (server) { server.kill(); server = null; await sleep(500); }
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  dataDir = null;
 
   console.log(`\n===== 结果: ${failures.length ? 'FAIL' : 'PASS'}（失败 ${failures.length} 项） =====`);
   for (const f of failures) console.log('  -', f);
@@ -393,5 +459,7 @@ async function main() {
 main().catch((err) => {
   console.error('测试脚本异常:', err);
   if (chrome) { try { chrome.kill(); } catch (_) { /* ignore */ } }
+  if (server) { try { server.kill(); } catch (_) { /* ignore */ } }
+  if (dataDir) { try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (_) { /* ignore */ } }
   process.exit(2);
 });
