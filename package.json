@@ -1,20 +1,73 @@
 {
   "name": "life-steward",
-  "version": "0.1.0",
+  "version": "0.6.2",
   "private": true,
-  "description": "生活管家 —— 执行合一 · 思维建设与管理的本地助手（反思打卡功能）",
-  "main": "server.js",
+  "description": "生活管家 —— 执行合一 · 思维建设与管理的本地助手（双界面导航、核心思想与复盘模板）",
+  "main": "desktop/main.js",
   "scripts": {
     "start": "node server.js",
     "start:no-open": "node server.js --no-open",
+    "desktop": "electron .",
+    "test:desktop": "node qa/desktop-reminders-test.js",
+    "test:desktop-build": "node qa/desktop-build-test.mjs",
+    "test:desktop-drawings": "node qa/desktop-drawings-test.mjs",
+    "build:windows": "node desktop/build-windows.js",
     "test:thoughts": "node qa/thought-v6-api-test.mjs && node qa/cdp-thought-v6-ui-test.mjs",
     "test:first-round": "node qa/first-round-api-test.mjs && node qa/event-model-test.mjs",
     "test:principles": "node qa/principles-v10-api-test.mjs && node qa/cdp-principles-stats-ui-test.mjs",
-    "test:event-memos": "node qa/event-memos-test.mjs"
+    "test:event-memos": "node qa/event-memos-test.mjs",
+    "test:learning": "node qa/cdp-learning-test.mjs",
+    "test:libraries": "node qa/categorized-libraries-api-test.mjs && node qa/cdp-categorized-libraries-test.mjs",
+    "test:categorization": "node qa/flat-categorization-test.mjs",
+    "test:navigation": "node qa/navigation-api-test.mjs && node qa/navigation-upgrade-backup-test.mjs && node qa/cdp-navigation-test.mjs",
+    "test:custom-modules": "node qa/custom-modules-api-test.mjs && node qa/custom-modules-upgrade-backup-test.mjs && node qa/cdp-custom-modules-test.mjs",
+    "test:rich-content": "node qa/rich-content-api-test.mjs",
+    "test:rich-content-ui": "node qa/cdp-rich-content-test.mjs",
+    "build:drawing": "node drawing/build.mjs",
+    "test:drawings": "node qa/drawings-api-test.mjs && node qa/drawings-recovery-test.mjs && node qa/cdp-drawings-test.mjs",
+    "test:drawing-manager": "node qa/drawing-manager-api-test.mjs && node qa/drawing-manager-recovery-test.mjs && node qa/cdp-drawing-manager-test.mjs",
+    "test:drawing-return": "node qa/cdp-drawing-return-test.mjs",
+    "test:drawing-text-focus": "node qa/cdp-drawing-text-focus-test.mjs",
+    "test:trash": "node qa/trash-api-test.mjs"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   },
   "license": "UNLICENSED",
-  "dependencies": {}
+  "build": {
+    "appId": "com.life-steward.desktop",
+    "productName": "生活管家",
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "server.js",
+      "package.json",
+      "drawing-store.js",
+      "drawing-manager.js",
+      "trash-store.js"
+    ],
+    "directories": {
+      "output": "artifacts",
+      "buildResources": "build"
+    },
+    "electronDist": "node_modules/electron/dist",
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "public/assets/sprout-logo.png"
+    },
+    "portable": {
+      "artifactName": "生活管家-${version}-Windows.${ext}"
+    }
+  },
+  "devDependencies": {
+    "@excalidraw/excalidraw": "0.18.1",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "0.28.2",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
 }

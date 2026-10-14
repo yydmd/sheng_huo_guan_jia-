@@ -5,10 +5,23 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 let state = {
   version: 0,
-  sections: [], records: {}, checkinReasons: {}, thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], templates: [], problems: [],
+  sections: [], records: {}, checkinReasons: {}, thoughtEntries: [], thoughtCategories: [], reflectFrameworks: [], reflectEntries: {}, plans: [], templates: [], problems: [], learningCategories: [], learningTemplates: [],
+  planCategories: [], templateCategories: [], problemCategories: [],
+  coreThoughtCategories: [], coreThoughtTemplates: [], reviewTemplateCategories: [], reviewTemplates: [],
   events: [], eventCheckins: {}, eventExceptions: [], backups: [],
 };
-let currentView = 'events';
+let currentView = 'events';                   // 业务模块 ID | 'settings' | null（当前界面无模块）
+let currentWorkspace = 'main';                 // 'main' 当前界面 | 'zone' 专区界面
+let dataEpoch = null;
+let dataReloadRequired = false;
+let settingsGeneration = 0;
+let customCreation = null;
+let customCreationPromise = null;
+let navigationPreferences = null;              // 服务端规范的模块顺序/归属/最近视图
+let trashedModuleIds = [];                    // 已进垃圾站的内置模块，不进入活动导航
+let trashEntries = [];
+let navigationContextQueue = Promise.resolve(); // 浏览记录请求串行化，旧响应不覆盖新状态
+let contextFailureNotified = false;
 let currentPrincipleTab = 'checkin';
 let selectedDate = localToday();
 let selectedReviewDate = addDays(localToday(), -1);
@@ -49,6 +62,11 @@ let problemTimer = null;                  // 问题自动保存防抖计时器
 let problemSavePromise = null;            // 当前正在提交的问题请求
 let problemMenuOpenId = null;             // 问题列表“更多”菜单当前打开的问题 id
 let problemRetry = null;                  // 问题保存失败时的重试快照
+const flatCollectionRuntime = {
+  plans: { categoryFilter: 'all', filterMenuOpen: false, moveMenuOpenId: null },
+  templates: { categoryFilter: 'all', filterMenuOpen: false, moveMenuOpenId: null },
+  problems: { categoryFilter: 'all', filterMenuOpen: false, moveMenuOpenId: null },
+};
 let eventDate = localToday();             // 事件安排独立日期（允许过去与未来）
 let eventMode = 'schedule';               // 'schedule' | 'calendar' | 'recurring' | 'memos'
 let eventCalendarCursor = null;           // 月历当前显示的 'YYYY-MM'
@@ -59,10 +77,273 @@ let eventRecurringFilter = 'all';         // 固定安排筛选：'all' | 'daily
 let eventDoneCollapsed = false;           // 日程页已完成列表是否折叠
 let eventNoteExpandedKey = null;          // 当前展开完整备注的事件实例键
 
+// ---------- 模块注册表与界面导航 ----------
+
+// 九个业务模块的稳定身份；设置、品牌与界面切换按钮为固定入口，不参与归属与排序
+const BUILTIN_MODULE_REGISTRY = [
+  { id: 'events', name: '重要时间点', icon: 'calendar-check', placement: 'main' },
+  { id: 'principles', name: '原则打卡', icon: 'circle-play', placement: 'main' },
+  { id: 'problems', name: '问题拆解', icon: 'folder-tree', placement: 'zone' },
+  { id: 'plans', name: '计划', icon: 'calendar-days', placement: 'main' },
+  { id: 'thoughts', name: '所思', icon: 'message-circle', placement: 'main' },
+  { id: 'templates', name: '个人模板', icon: 'layout-template', placement: 'main' },
+  { id: 'learning', name: '学习专区', icon: 'graduation-cap', placement: 'zone' },
+  { id: 'coreThoughts', name: '核心思想', icon: 'lightbulb', placement: 'zone' },
+  { id: 'reviewTemplates', name: '复盘', icon: 'history', placement: 'zone' },
+];
+let MODULE_REGISTRY = [...BUILTIN_MODULE_REGISTRY];
+let MODULE_IDS = MODULE_REGISTRY.map((module) => module.id);
+const WORKSPACE_LABELS = { main: '当前界面', zone: '专区界面' };
+
+// 设置页草稿：进入设置时从已保存配置复制；拖动/箭头/位置切换只改草稿，保存时一次提交
+let settingsDraft = null;                 // { moduleOrder: [], placementByModule: {} }
+let settingsBaseRevision = 0;             // 进入设置时记录的配置 revision
+let settingsDirty = false;                // 草稿是否与基线不同
+let settingsSaving = null;                // 进行中的保存 Promise（防止重复提交）
+let settingsStatus = { text: '', error: false };
+let settingsReturn = null;                // 进入设置前所在的 { workspace, view }
+let pendingNavigation = null;             // 草稿未保存时暂存的离开目标
+let dataRestoreLock = false;              // 恢复备份期间禁止新的自动保存
+
+function moduleById(id) { return MODULE_REGISTRY.find((module) => module.id === id) || null; }
+function isModuleView(view) { return MODULE_IDS.includes(view); }
+
+function placementOfModule(id) {
+  const placement = navigationPreferences?.placementByModule?.[id];
+  return placement === 'main' || placement === 'zone' ? placement : moduleById(id)?.placement || 'main';
+}
+
+function orderedModuleIds() {
+  const order = navigationPreferences?.moduleOrder;
+  if (!Array.isArray(order)) return [...MODULE_IDS];
+  const known = order.filter((id) => isModuleView(id));
+  for (const id of MODULE_IDS) if (!known.includes(id)) known.push(id);
+  return known;
+}
+
+function workspaceModuleIds(workspace) {
+  return orderedModuleIds().filter((id) => placementOfModule(id) === workspace);
+}
+
+// 目标界面的有效视图：优先上次访问且仍归属该界面的模块，否则第一项，空界面为 null
+function resolveWorkspaceView(workspace, preferred) {
+  const ids = workspaceModuleIds(workspace);
+  if (preferred && ids.includes(preferred)) return preferred;
+  return ids[0] || null;
+}
+
+function normalizeNavigationPreferences(raw) {
+  const fallback = {
+    schemaVersion: 1, revision: 0, moduleOrder: [...MODULE_IDS],
+    placementByModule: Object.fromEntries(MODULE_REGISTRY.map((module) => [module.id, module.placement])),
+    lastWorkspace: 'main', lastViewByWorkspace: { main: 'events', zone: 'problems' },
+  };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
+  const order = Array.isArray(raw.moduleOrder)
+    ? raw.moduleOrder.filter((id, index) => isModuleView(id) && raw.moduleOrder.indexOf(id) === index)
+    : [];
+  for (const id of MODULE_IDS) if (!order.includes(id)) order.push(id);
+  const rawPlacement = raw.placementByModule && typeof raw.placementByModule === 'object' ? raw.placementByModule : {};
+  const placement = {};
+  for (const id of MODULE_IDS) {
+    const value = rawPlacement[id];
+    placement[id] = value === 'main' || value === 'zone' ? value : (moduleById(id)?.placement || 'main');
+  }
+  const lastWorkspace = raw.lastWorkspace === 'zone' ? 'zone' : 'main';
+  const lastView = { main: null, zone: null };
+  for (const ws of ['main', 'zone']) {
+    const ids = order.filter((id) => placement[id] === ws);
+    lastView[ws] = ids.includes(raw.lastViewByWorkspace?.[ws]) ? raw.lastViewByWorkspace[ws] : (ids[0] || null);
+  }
+  return {
+    schemaVersion: 1,
+    revision: Number.isInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0,
+    moduleOrder: order,
+    placementByModule: placement,
+    lastWorkspace,
+    lastViewByWorkspace: lastView,
+  };
+}
+
+// 浏览记录：立即更新本地记忆并串行提交服务端；失败提示一次但不打断浏览
+function recordNavigationContext(workspace, view) {
+  if (!navigationPreferences) return;
+  navigationPreferences.lastWorkspace = workspace;
+  navigationPreferences.lastViewByWorkspace = { ...navigationPreferences.lastViewByWorkspace, [workspace]: view };
+  navigationContextQueue = navigationContextQueue.then(async () => {
+    try {
+      await api('PATCH', '/api/navigation/context', { workspace, view });
+    } catch (error) {
+      if (!contextFailureNotified) {
+        contextFailureNotified = true;
+        toast(`浏览记录保存失败：${error.message}`, true);
+      }
+    }
+  });
+}
+
+// ---------- 分类模板库（学习专区 / 核心思想 / 复盘共用） ----------
+
+const LIBRARY_MODULES = {
+  learning: {
+    id: 'learning',
+    eyebrow: '学习专区',
+    listHint: '还没有学习模板。',
+    filteredListHint: '这个分类还没有模板。',
+    emptyTitle: '建立第一个学习模板',
+    emptyBody: '把学习方法整理成模板，按分类随时取用。',
+    newPlaceholder: '例如：学习模式、读书笔记模板',
+    categoryPlaceholder: '例如：通用学习、编程开发、英语学习',
+    templatesKey: 'learningTemplates',
+    categoriesKey: 'learningCategories',
+    apiCategories: '/api/learning-categories',
+    apiTemplates: '/api/learning/templates',
+    // 学习专区保留旧操作名（兼容既有使用习惯）；新模块统一 library-* 前缀并携带 data-library
+    legacyActions: true,
+    editor: { name: 'learningName', content: 'learningContent', note: 'learningNote', status: 'learningStatus' },
+    editorIcon: 'graduation-cap',
+  },
+  coreThoughts: {
+    id: 'coreThoughts',
+    eyebrow: '核心思想',
+    listHint: '还没有核心思想模板。',
+    filteredListHint: '这个分类还没有模板。',
+    emptyTitle: '建立第一个核心思想模板',
+    emptyBody: '把反复出现的核心想法整理成模板，按领域随时取用。',
+    newPlaceholder: '例如：第一性原理、长期主义',
+    categoryPlaceholder: '例如：思维模型、价值观、决策原则',
+    templatesKey: 'coreThoughtTemplates',
+    categoriesKey: 'coreThoughtCategories',
+    apiCategories: '/api/core-thought/categories',
+    apiTemplates: '/api/core-thought/templates',
+    legacyActions: false,
+    editor: { name: 'libraryName', content: 'libraryContent', note: 'libraryNote', status: 'libraryStatus' },
+    editorIcon: 'lightbulb',
+  },
+  reviewTemplates: {
+    id: 'reviewTemplates',
+    eyebrow: '复盘',
+    listHint: '还没有复盘模板。',
+    filteredListHint: '这个分类还没有模板。',
+    emptyTitle: '建立第一个复盘模板',
+    emptyBody: '把复盘框架整理成模板，按领域随时取用。',
+    newPlaceholder: '例如：每日复盘、项目复盘',
+    categoryPlaceholder: '例如：每日复盘、项目复盘、习惯养成',
+    templatesKey: 'reviewTemplates',
+    categoriesKey: 'reviewTemplateCategories',
+    apiCategories: '/api/review-template/categories',
+    apiTemplates: '/api/review-template/templates',
+    legacyActions: false,
+    editor: { name: 'libraryName', content: 'libraryContent', note: 'libraryNote', status: 'libraryStatus' },
+    editorIcon: 'history',
+  },
+};
+
+// 每个模块独立拥有选中模板、筛选、菜单、防抖计时器、请求与重试快照
+const libraryRuntime = {};
+function libraryState(moduleId) {
+  if (!libraryRuntime[moduleId]) {
+    libraryRuntime[moduleId] = {
+      selectedId: null, timer: null, savePromise: null, retry: null,
+      menuOpenId: null, filterMenuOpen: false, categoryFilter: 'all', moveMenuOpenId: null,
+    };
+  }
+  return libraryRuntime[moduleId];
+}
+
+function libraryOwner(moduleId) {
+  return LIBRARY_MODULES[moduleId]?.custom ? state.customModules.find((entry) => entry.id === moduleId) : state;
+}
+function libraryTemplates(moduleId) { return libraryOwner(moduleId)[LIBRARY_MODULES[moduleId].templatesKey]; }
+function libraryCategories(moduleId) { return libraryOwner(moduleId)[LIBRARY_MODULES[moduleId].categoriesKey]; }
+function setLibraryTemplates(moduleId, entries) { libraryOwner(moduleId)[LIBRARY_MODULES[moduleId].templatesKey] = entries; }
+function setLibraryCategories(moduleId, entries) { libraryOwner(moduleId)[LIBRARY_MODULES[moduleId].categoriesKey] = entries; }
+
+// 定义先安装、导航后规范化；已有库内容和保存runtime不被导航快照覆盖。
+function installCustomModules(modules, replace = false) {
+  CustomModuleModel.validate(modules, 1);
+  const old = new Map((state.customModules || []).map((entry) => [entry.id, entry]));
+  state.customModules = modules.map((entry) => {
+    if (replace || !old.has(entry.id)) return entry;
+    const local = old.get(entry.id);
+    return { ...entry, categories: local.categories, templates: local.templates };
+  });
+  for (const id of Object.keys(LIBRARY_MODULES)) if (LIBRARY_MODULES[id].custom) delete LIBRARY_MODULES[id];
+  MODULE_REGISTRY = [...BUILTIN_MODULE_REGISTRY.filter((entry) => !trashedModuleIds.includes(entry.id)), ...state.customModules.map((entry) => ({ id: entry.id, name: entry.name, icon: entry.icon, placement: entry.defaultPlacement }))];
+  MODULE_IDS = MODULE_REGISTRY.map((entry) => entry.id);
+  for (const entry of state.customModules) {
+    LIBRARY_MODULES[entry.id] = {
+      id: entry.id, custom: true, eyebrow: entry.name, listHint: '还没有模板。', filteredListHint: '这个分类还没有模板。',
+      emptyTitle: '建立第一个模板', emptyBody: '按分类整理你的模板、内容和使用备注。',
+      newPlaceholder: '例如：常用记录模板', categoryPlaceholder: '例如：通用、工作、生活',
+      templatesKey: 'templates', categoriesKey: 'categories', apiCategories: `/api/custom-modules/${entry.id}/categories`,
+      apiTemplates: `/api/custom-modules/${entry.id}/templates`, legacyActions: false,
+      editor: { name: 'libraryName', content: 'libraryContent', note: 'libraryNote', status: 'libraryStatus' }, editorIcon: entry.icon,
+    };
+  }
+}
+
+function applyNavigationSnapshot(result, replace = false) {
+  if (dataEpoch && result.dataEpoch && dataEpoch !== result.dataEpoch) { requireDataReload(); return false; }
+  if (!replace && navigationPreferences && result.navigationPreferences.revision < navigationPreferences.revision) return false;
+  if (Array.isArray(result.trashedModuleIds)) trashedModuleIds = result.trashedModuleIds;
+  installCustomModules(result.customModules || [], replace);
+  navigationPreferences = normalizeNavigationPreferences(result.navigationPreferences);
+  dataEpoch = result.dataEpoch || dataEpoch;
+  return true;
+}
+
+function requireDataReload() {
+  dataReloadRequired = true;
+  for (const rt of Object.values(libraryRuntime)) { clearTimeout(rt.timer); rt.timer = null; }
+  const notice = $('#dataReloadNotice');
+  notice.hidden = false;
+  notice.querySelector('button').onclick = () => {
+    if (confirm('数据已恢复或服务已重启。重新载入会放弃本页尚未保存的修改，请先复制需要保留的文字。是否重新载入？')) {
+      dataRestoreLock = true; discardPendingLibrarySaves(); location.reload();
+    }
+  };
+  toast('数据已变化，请保留未保存文字并确认重新载入', true);
+}
+function libraryCurrentTemplate(moduleId) {
+  return libraryTemplates(moduleId).find((template) => template.id === libraryState(moduleId).selectedId) || null;
+}
+
+// 学习专区沿用旧操作名（保持既有兼容），新模块统一 library-* 前缀并携带 data-library
+const LEGACY_LIBRARY_ACTIONS = {
+  add: 'add-learning',
+  select: 'select-learning',
+  menu: 'open-learning-menu',
+  move: 'move-learning',
+  'delete': 'delete-learning',
+  'retry-save': 'retry-learning-save',
+  'add-category': 'add-learning-category',
+  'rename-category': 'rename-learning-category',
+  'delete-category': 'delete-learning-category',
+  'set-filter': 'set-learning-filter',
+  'toggle-filter': 'toggle-learning-filter',
+  'open-category-manager': 'open-learning-category-manager',
+};
+function libraryActionName(moduleId, key) {
+  return LIBRARY_MODULES[moduleId].legacyActions ? LEGACY_LIBRARY_ACTIONS[key] : `library-${key}`;
+}
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[char]));
+}
+
+function richPreview(item, textKey, blocksKey, fallback) {
+  const text = String(item?.[textKey] || '').trim();
+  const drawings = LifeDrawings.searchText(item?.[blocksKey]);
+  if (text || drawings) return [text, drawings].filter(Boolean).join(' · ');
+  if (Array.isArray(item?.[blocksKey]) && item[blocksKey].some((block) => block?.type === 'image')) return '包含图片';
+  return fallback;
+}
+
+function cloneRichBlocks(blocks) {
+  return Array.isArray(blocks) ? blocks.map((block) => ({ ...block })) : undefined;
 }
 
 function toISODate(date) {
@@ -113,6 +394,15 @@ function activeItemsOn(date) {
   });
 }
 function recordFor(date = selectedDate) { return state.records[date] || {}; }
+function forgetCheckinIds(ids) {
+  const drop = new Set(ids);
+  for (const bucket of [state.records, state.checkinReasons]) {
+    for (const date of Object.keys(bucket || {})) {
+      for (const id of drop) delete bucket[date][id];
+      if (bucket[date] && !Object.keys(bucket[date]).length) delete bucket[date];
+    }
+  }
+}
 function reasonFor(itemId, date = selectedDate) { return state.checkinReasons[date]?.[itemId] || ''; }
 function checkinStatus(itemId, date) {
   const record = state.records[date] || {};
@@ -136,17 +426,147 @@ function allNodeContexts() {
 }
 function currentPlan() { return state.plans.find((plan) => plan.id === selectedPlanId) || null; }
 function currentTemplate() { return state.templates.find((template) => template.id === selectedTemplateId) || null; }
+function currentProblem() { return state.problems.find((problem) => problem.id === selectedProblemId) || null; }
+
+const FLAT_COLLECTIONS = {
+  plans: {
+    itemsKey: 'plans', categoriesKey: 'planCategories', itemLabel: '计划',
+    listTitle: '全部计划', railLabel: '全部计划', emptyTitle: '建立第一个计划',
+    emptyBody: '为一个真正想推进的方向写下名称和清楚的下一步。',
+    addAction: 'add-plan', selectAction: 'select-plan', menuAction: 'open-plan-menu',
+    reorderAction: 'move-plan', deleteAction: 'delete-plan',
+    addEndpoint: '/api/plans', reorderEndpoint: '/api/plans/reorder', responseKey: 'plans',
+  },
+  templates: {
+    itemsKey: 'templates', categoriesKey: 'templateCategories', itemLabel: '个人模板',
+    listTitle: '全部模板', railLabel: '全部模板', emptyTitle: '建立第一个模板',
+    emptyBody: '把常用的内容整理成模板，需要时直接取用。',
+    addAction: 'add-template', selectAction: 'select-template', menuAction: 'open-template-menu',
+    reorderAction: 'move-template', deleteAction: 'delete-template',
+    addEndpoint: '/api/templates', reorderEndpoint: '/api/templates/reorder', responseKey: 'templates',
+  },
+  problems: {
+    itemsKey: 'problems', categoriesKey: 'problemCategories', itemLabel: '问题拆解',
+    listTitle: '全部问题', railLabel: '全部问题', emptyTitle: '建立第一个问题',
+    emptyBody: '把一个反复出现的大问题写下来，拆成看得清的小步骤。',
+    addAction: 'add-problem', selectAction: 'select-problem', menuAction: 'open-problem-menu',
+    reorderAction: 'move-problem', deleteAction: 'delete-problem',
+    addEndpoint: '/api/problems', reorderEndpoint: '/api/problems/reorder', responseKey: 'problems',
+  },
+};
+
+function flatConfig(collection) { return FLAT_COLLECTIONS[collection]; }
+function flatState(collection) { return flatCollectionRuntime[collection]; }
+function flatCategories(collection) { return state[flatConfig(collection).categoriesKey] || []; }
+function flatItems(collection) { return state[flatConfig(collection).itemsKey] || []; }
+function flatSelectedId(collection) {
+  return collection === 'plans' ? selectedPlanId : collection === 'templates' ? selectedTemplateId : selectedProblemId;
+}
+function setFlatSelectedId(collection, id) {
+  if (collection === 'plans') selectedPlanId = id;
+  else if (collection === 'templates') selectedTemplateId = id;
+  else selectedProblemId = id;
+}
+function flatItemsForFilter(collection) {
+  const rt = flatState(collection);
+  const items = flatItems(collection), categories = flatCategories(collection);
+  if (rt.categoryFilter === 'all') return items;
+  if (rt.categoryFilter === 'none') return items.filter((item) => !item.categoryId || !categories.some((category) => category.id === item.categoryId));
+  return items.filter((item) => item.categoryId === rt.categoryFilter);
+}
+function flatCategoryCount(collection, categoryId) {
+  const items = flatItems(collection), categories = flatCategories(collection);
+  if (categoryId === 'all') return items.length;
+  if (categoryId === 'none') return items.filter((item) => !item.categoryId || !categories.some((category) => category.id === item.categoryId)).length;
+  return items.filter((item) => item.categoryId === categoryId).length;
+}
+function flatFilterLabel(collection) {
+  const rt = flatState(collection);
+  if (rt.categoryFilter === 'all') return '全部分类';
+  if (rt.categoryFilter === 'none') return '未分类';
+  return flatCategories(collection).find((category) => category.id === rt.categoryFilter)?.name || '全部分类';
+}
+function flatAction(collection, action) { return `flat-${action}`; }
+
+function renderFlatToolbar(collection) {
+  const config = flatConfig(collection), rt = flatState(collection);
+  const rows = [
+    { id: 'all', name: '全部分类' },
+    ...flatCategories(collection).map((category) => ({ id: category.id, name: category.name })),
+    { id: 'none', name: '未分类' },
+  ];
+  return `<div class="learning-toolbar flat-toolbar" data-flat-collection="${collection}">
+    <button class="button primary small" data-action="${config.addAction}"><i data-lucide="plus"></i>新建${config.itemLabel === '问题拆解' ? '问题' : config.itemLabel === '个人模板' ? '模板' : '计划'}</button>
+    <div class="learning-filter-wrap">
+      <button class="learning-filter-btn ${rt.filterMenuOpen ? 'open' : ''}" data-action="${flatAction(collection, 'toggle-filter')}" data-collection="${collection}" aria-haspopup="menu" aria-expanded="${rt.filterMenuOpen}">
+        <i data-lucide="folder"></i><span>${escapeHtml(flatFilterLabel(collection))}</span><i data-lucide="chevron-down"></i>
+      </button>
+      ${rt.filterMenuOpen ? `<div class="plan-menu learning-filter-menu" data-flat-filter-menu="${collection}" role="menu" aria-label="按分类筛选">
+        ${rows.map((row) => `<button class="plan-menu-item ${rt.categoryFilter === row.id ? 'active' : ''}" role="menuitem" data-action="${flatAction(collection, 'set-filter')}" data-collection="${collection}" data-filter="${escapeHtml(row.id)}"><span class="learning-filter-name">${escapeHtml(row.name)}</span><span class="learning-filter-count">${flatCategoryCount(collection, row.id)}</span></button>`).join('')}
+        <div class="learning-filter-sep" role="separator"></div>
+        <button class="plan-menu-item" role="menuitem" data-action="${flatAction(collection, 'open-category-manager')}" data-collection="${collection}"><i data-lucide="settings-2"></i>管理分类</button>
+      </div>` : ''}
+    </div>
+    <button class="button teal small" data-action="${flatAction(collection, 'add-category')}" data-collection="${collection}"><i data-lucide="plus"></i>新建分类</button>
+  </div>`;
+}
+
+function renderFlatMoveSubmenu(collection, item) {
+  const rt = flatState(collection);
+  if (rt.moveMenuOpenId !== item.id) return '';
+  const current = item.categoryId || 'none';
+  const rows = [{ id: 'none', name: '未分类' }, ...flatCategories(collection).map((category) => ({ id: category.id, name: category.name }))];
+  return `<div class="flat-category-submenu" data-flat-move-menu="${collection}" role="menu" aria-label="移动到分类">
+    <div class="flat-category-submenu-title">移动到分类</div>
+    ${rows.map((row) => `<button class="plan-menu-item ${current === row.id ? 'active' : ''}" role="menuitem" data-action="${flatAction(collection, 'move-category')}" data-collection="${collection}" data-id="${item.id}" data-category-id="${escapeHtml(row.id)}"><span class="learning-filter-name">${escapeHtml(row.name)}</span>${current === row.id ? '<span aria-hidden="true">✓</span>' : ''}</button>`).join('')}
+  </div>`;
+}
+
+function renderFlatCategoryManager(collection) {
+  const config = flatConfig(collection), categories = flatCategories(collection);
+  $('#modalEyebrow').textContent = `${config.itemLabel} · 分类`;
+  $('#modalTitle').textContent = '管理分类';
+  $('#modalBody').innerHTML = `<div class="thought-category-manager">
+    <div class="thought-category-row system"><span>未分类</span><small>系统分类</small></div>
+    ${categories.length ? categories.map((category) => `<div class="thought-category-row"><span>${escapeHtml(category.name)}</span><div class="row-actions"><button class="mini-button" data-action="${flatAction(collection, 'rename-category')}" data-collection="${collection}" data-id="${category.id}" aria-label="重命名分类${escapeHtml(category.name)}"><i data-lucide="pencil"></i></button><button class="mini-button danger" data-action="${flatAction(collection, 'delete-category')}" data-collection="${collection}" data-id="${category.id}" aria-label="删除分类${escapeHtml(category.name)}"><i data-lucide="trash-2"></i></button></div></div>`).join('') : '<p class="status-text">还没有自定义分类。</p>'}
+  </div>`;
+  $('#modalActions').innerHTML = `<button class="button ghost" data-modal-cancel>关闭</button><button class="button primary" data-action="${flatAction(collection, 'add-category')}" data-collection="${collection}"><i data-lucide="plus"></i>新建分类</button>`;
+  $('#modalBackdrop').classList.remove('hidden');
+  $('[data-modal-cancel]').onclick = closeModal;
+  renderIcons();
+}
 
 async function api(method, url, body) {
   const options = { method, headers: {} };
+  const guarded = method !== 'GET';
+  if (guarded) {
+    if (dataReloadRequired) throw Object.assign(new Error('数据已变化，请确认重新载入'), { code: 'DATA_EPOCH_CHANGED' });
+    options.headers['X-Life-Data-Epoch'] = dataEpoch;
+  }
   if (body !== undefined) {
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(url, options);
-  let data = null;
-  try { data = await response.json(); } catch (_) { /* empty response */ }
-  if (!response.ok) throw new Error(data?.error || `请求失败（${response.status}）`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  let response, data = null;
+  try {
+    response = await fetch(url, { ...options, signal: controller.signal });
+    try { data = await response.json(); } catch (error) {
+      if (controller.signal.aborted) throw error;
+      if (response.ok) throw new Error('响应内容不完整，请确认操作结果');
+    }
+  } finally { clearTimeout(timeout); }
+  if (!response.ok) {
+    const error = new Error(data?.error || `请求失败（${response.status}）`);
+    error.status = response.status;
+    error.code = data?.code;
+    error.commitState = data?.commitState;
+    error.snapshot = data;
+    if (error.code === 'DATA_EPOCH_CHANGED') requireDataReload();
+    if (data && typeof data === 'object' && data.navigationPreferences) error.navigationPreferences = data.navigationPreferences;
+    throw error;
+  }
   return data;
 }
 
@@ -176,10 +596,27 @@ function emptyState(icon, title, body, actionHtml = '') {
 
 function setActiveNavigation() {
   $$('.nav-item[data-view]').forEach((button) => {
-    const isSettings = button.dataset.openTab === 'manage';
-    const active = button.dataset.view === currentView && (!isSettings || currentPrincipleTab === 'manage');
-    button.classList.toggle('active', active);
+    button.classList.toggle('active', button.dataset.view === currentView);
   });
+}
+
+// 侧栏由模块注册表 + 用户配置生成：只显示分配给当前界面的模块，顺序取全局排序
+function renderSidebarNav() {
+  const items = workspaceModuleIds(currentWorkspace)
+    .map((id) => moduleById(id))
+    .filter(Boolean);
+  $('#primaryNav').innerHTML = items
+    .map((module) => `<button class="nav-item ${module.id === currentView ? 'active' : ''}" data-view="${module.id}" title="${escapeHtml(module.name)}"><i data-lucide="${module.icon}"></i><span>${escapeHtml(module.name)}</span></button>`)
+    .join('');
+  const switchButton = $('#workspaceSwitch');
+  if (switchButton) {
+    const toZone = currentWorkspace === 'main';
+    switchButton.dataset.workspace = toZone ? 'zone' : 'main';
+    switchButton.setAttribute('aria-label', toZone ? '进入专区' : '返回当前界面');
+    switchButton.innerHTML = toZone
+      ? '<i data-lucide="layout-grid"></i><span>进入专区</span><i data-lucide="arrow-right"></i>'
+      : '<i data-lucide="arrow-left"></i><span>返回当前界面</span>';
+  }
 }
 
 function renderTopbar() {
@@ -190,8 +627,15 @@ function renderTopbar() {
     plans: ['计划', '让长期方向始终落到清楚的下一步。'],
     templates: ['个人模板', '把常用的内容整理成模板，需要时直接取用。'],
     problems: ['问题拆解', '把大问题拆成小步骤，看清下一步能做什么。'],
+    learning: ['学习专区', '按学习领域和主题分类管理你的学习模板。'],
+    coreThoughts: ['核心思想', '按思想领域和主题分类管理你的核心思想模板。'],
+    reviewTemplates: ['复盘', '按复盘领域和主题分类管理你的复盘模板。'],
+    settings: ['设置', '管理模块的显示位置和排列顺序。'],
+    drawingManager: ['画布管理', '所有画布，集中整理与快速打开。'],
   };
-  const [title, subtitle] = titles[currentView];
+  const [title, subtitle] = currentView === null
+    ? [WORKSPACE_LABELS[currentWorkspace], '此界面还没有分配模块，可以在设置中调整。']
+    : titles[currentView] || [moduleById(currentView)?.name || '模块', '按分类管理你的模板、内容和使用备注。'];
   let tools = '';
   if ((currentView === 'principles' && currentPrincipleTab !== 'stats') || currentView === 'thoughts') {
     const onHistory = currentView === 'thoughts' && thoughtSurface === 'history';
@@ -214,15 +658,30 @@ function renderTopbar() {
 }
 
 function render() {
+  renderSidebarNav();
   setActiveNavigation();
   renderTopbar();
-  if (currentView === 'events') renderEvents();
-  if (currentView === 'principles') renderPrinciples();
-  if (currentView === 'thoughts') renderThoughts();
-  if (currentView === 'plans') renderPlans();
-  if (currentView === 'templates') renderTemplates();
-  if (currentView === 'problems') renderProblems();
+  if (currentView === 'drawingManager') DrawingManagerUI.render();
+  else if (currentView === 'settings') renderSettingsPage();
+  else if (currentView === null) renderEmptyWorkspace();
+  else if (LIBRARY_MODULES[currentView]) renderLibraryPage(currentView);
+  else if (currentView === 'events') renderEvents();
+  else if (currentView === 'principles') renderPrinciples();
+  else if (currentView === 'thoughts') renderThoughts();
+  else if (currentView === 'plans') renderPlans();
+  else if (currentView === 'templates') renderTemplates();
+  else if (currentView === 'problems') renderProblems();
   renderIcons();
+  bindRichEditors();
+  bindRichViewer();
+  LifeDrawings.renderTabs();
+}
+
+// 当前界面没有任何模块时的空状态：切换入口与设置仍可用
+function renderEmptyWorkspace() {
+  $('#app').innerHTML = `<section class="page content-page">
+    ${emptyState('layout-grid', `${WORKSPACE_LABELS[currentWorkspace]}还没有模块`, '所有模块都放在另一个界面。可以在设置中调整模块归属，或用左侧按钮切换界面。', `<button class="button primary" data-action="open-settings"><i data-lucide="settings"></i>前往设置</button>`)}
+  </section>`;
 }
 
 // ---------- 事件安排 ----------
@@ -582,11 +1041,11 @@ function renderManageTab() {
       <div class="inline-add"><input id="addItem-${section.id}" placeholder="添加一个每天要做到的具体条目" data-add-item-input="${section.id}" /><button class="button ghost small" data-action="add-item" data-section="${section.id}"><i data-lucide="plus"></i>添加</button></div>
     </section>`).join('') : emptyState('sprout', '从一条真正相信的原则开始', '原则下面可以添加每天要做到的具体条目。', '<button class="button primary" data-action="add-section"><i data-lucide="plus"></i>新建原则</button>');
   const backupRows = state.backups.length
-    ? state.backups.map((backup) => `<li><div><strong>${new Date(backup.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><small>${backup.imageCount ? `包含 ${backup.imageCount} 张复盘图片` : '不含复盘图片'}${backup.label === 'before-restore' ? ' · 恢复前自动保存' : ''}</small></div><button class="button ghost small" data-action="restore-backup" data-id="${backup.id}"><i data-lucide="history"></i>恢复</button></li>`).join('')
+    ? state.backups.map((backup) => `<li><div><strong>${new Date(backup.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><small>${backup.imageCount ? `包含 ${backup.imageCount} 张复盘图片` : '不含复盘图片'} · ${backup.drawingCount || 0} 张图稿${backup.label === 'before-restore' ? ' · 恢复前自动保存' : ''}</small></div><button class="button ghost small" data-action="restore-backup" data-id="${backup.id}"><i data-lucide="history"></i>恢复</button></li>`).join('')
     : '<p class="status-text">还没有备份。</p>';
   return `<div class="manage-grid">${sections}
     <section class="manage-section data-management">
-      <div class="manage-section-head"><div><h3>数据备份</h3><p>备份会保存在这台电脑，包含所有记录和复盘图片。</p></div><button class="button ghost small" data-action="create-backup"><i data-lucide="archive"></i>立即备份</button></div>
+      <div class="manage-section-head"><div><h3>数据备份</h3><p>备份会保存在这台电脑，包含所有记录、复盘图片、图稿、垃圾站及绘图素材库。</p></div><button class="button ghost small" data-action="create-backup"><i data-lucide="archive"></i>立即备份</button></div>
       <ul class="backup-list">${backupRows}</ul>
     </section>
   </div>`;
@@ -927,7 +1386,7 @@ function renderThoughtEditorCard(thought) {
       </select>
       <button class="button ghost small" data-action="manage-thought-categories"><i data-lucide="settings-2"></i>管理类别</button>
     </div>
-    ${thoughtKind(thought) === 'review' && state.version >= 8 ? renderReviewEditor(thought) : `<textarea class="textarea free-thought" id="thoughtEditor" placeholder="${thoughtKind(thought) === 'review' ? '回顾今天：发生了什么、有哪些收获、明天想怎样改进……' : thoughtKind(thought) === 'extraction' ? '从文章、对话或笔记里摘出关键思想，写下出处和自己的理解……' : '此刻在想什么？写下今天的想法、灵感或目标……'}" aria-label="${label}内容">${escapeHtml(thought.text || '')}</textarea>`}
+    ${state.version >= 8 ? renderReviewEditor(thought) : `<textarea class="textarea free-thought" id="thoughtEditor" placeholder="${thoughtKind(thought) === 'review' ? '回顾今天：发生了什么、有哪些收获、明天想怎样改进……' : thoughtKind(thought) === 'extraction' ? '从文章、对话或笔记里摘出关键思想，写下出处和自己的理解……' : '此刻在想什么？写下今天的想法、灵感或目标……'}" aria-label="${label}内容">${escapeHtml(thought.text || '')}</textarea>`}
     <div class="save-line">
       <span id="thoughtStatus" role="status" aria-live="polite" data-action="retry-think-save">${thought.id === 'draft' ? '开始输入后自动保存' : '仅保存在本地'}</span>
       <span id="thoughtCount">${String(thought.text || '').replace(/\s/g, '').length} 字${thoughtKind(thought) === 'review' ? ` · ${reviewImages(thought).length} 张图片` : ''}</span>
@@ -1002,7 +1461,7 @@ function buildThoughtHistory() {
     .map((entry) => ({
       key: `thought:${entry.id}`, kind: thoughtKind(entry), date: entry.date, thought: entry,
       title: effectiveThoughtTitle(entry), categoryId: entry.categoryId || null,
-      preview: getThoughtPreview(entry.text) || (reviewImages(entry).length ? `${reviewImages(entry).length} 张图片` : ''), sortStamp: entry.updatedAt || entry.createdAt || entry.date,
+      preview: getThoughtPreview([entry.text, LifeDrawings.searchText(entry.blocks)].filter(Boolean).join(' · ')) || (reviewImages(entry).length ? `${reviewImages(entry).length} 张图片` : ''), sortStamp: entry.updatedAt || entry.createdAt || entry.date,
     }));
   const reflections = Object.entries(state.reflectEntries || {})
     .filter(([, entries]) => Object.values(entries || {}).some((text) => String(text || '').trim()))
@@ -1049,6 +1508,7 @@ function applyHistoryFilter(records) {
         isArticleMode(record.kind) ? record.thought.text : '',
         isArticleMode(record.kind) ? thoughtCategoryName(record.categoryId) : '',
         ...reviewImages(record.thought).map((block) => block.caption),
+        LifeDrawings.searchText(record.thought?.blocks),
         ...Object.values(record.reflect || {}),
         ...(record.kind === 'reflection' ? state.reflectFrameworks.map((framework) => framework.name) : []),
       ].join(' ').toLowerCase();
@@ -1144,7 +1604,7 @@ function renderHistoryDetail(record) {
         <h4>${label}</h4>
         <button class="button ghost small" data-action="edit-history-record" data-id="${record.thought.id}" data-date="${record.date}" data-mode="${record.kind}"><i data-lucide="pencil"></i>编辑${label}</button>
       </div>
-      ${reviewImages(record.thought).length ? renderReviewDocument(record.thought) : `<div class="history-text">${record.thought.text ? escapeHtml(record.thought.text) : `<span class="history-qa-empty">这篇${thoughtNoun(record.thought)}还没有正文。</span>`}</div>`}
+      ${record.thought.blocks?.some((b) => b.type !== 'text') ? renderReviewDocument(record.thought) : `<div class="history-text">${record.thought.text ? escapeHtml(record.thought.text) : `<span class="history-qa-empty">这篇${thoughtNoun(record.thought)}还没有正文。</span>`}</div>`}
     </section>` : ''}
     ${record.kind === 'reflection' ? `<section class="history-section">
       <div class="history-section-head">
@@ -1218,16 +1678,18 @@ function editHistoryRecord(date, mode, id = null) {
 }
 
 function renderPlans() {
-  if (!selectedPlanId && state.plans.length) selectedPlanId = state.plans[0].id;
+  const visible = flatItemsForFilter('plans');
+  if (!visible.some((item) => item.id === selectedPlanId)) selectedPlanId = visible[0]?.id || null;
   const plan = currentPlan();
   $('#app').innerHTML = `<section class="page content-page plans-page">
+    ${renderFlatToolbar('plans')}
     <aside class="plan-rail" aria-label="全部计划">
       <div class="plan-rail-head">
         <div class="plan-rail-title"><h2>全部计划</h2><span class="plan-count">${state.plans.length} 个</span></div>
         <button class="button primary small plan-new" data-action="add-plan"><i data-lucide="plus"></i>新建计划</button>
       </div>
       <div class="plan-list">
-        ${state.plans.length ? state.plans.map((item, index) => planListItem(item, index)).join('') : '<p class="status-text plan-empty-hint">还没有计划。</p>'}
+        ${visible.length ? visible.map((item, index) => planListItem(item, index, visible)).join('') : '<p class="status-text plan-empty-hint">当前分类还没有计划。</p>'}
       </div>
     </aside>
     <div class="plan-workspace">
@@ -1240,20 +1702,24 @@ function renderPlans() {
   }));
 }
 
-function planListItem(item, index) {
+function planListItem(item, index, visible = state.plans) {
   const open = planMenuOpenId === item.id;
-  const preview = (item.description || '').trim() || '尚未设置下一步';
+  const preview = richPreview(item, 'description', 'descriptionBlocks', '尚未设置下一步');
   const active = item.id === selectedPlanId;
+  const category = flatCategories('plans').find((entry) => entry.id === item.categoryId);
   return `<div class="plan-list-row ${active ? 'active' : ''}" data-id="${item.id}">
     <button class="plan-select" data-action="select-plan" data-id="${item.id}" aria-label="选择计划「${escapeHtml(item.name)}」">
       <span class="plan-name">${escapeHtml(item.name || '未命名计划')}</span>
       <span class="plan-preview">${escapeHtml(preview)}</span>
+      <span class="flat-category-label">${escapeHtml(category?.name || '未分类')}</span>
     </button>
     <div class="plan-more-wrap">
       <button class="plan-more" data-action="open-plan-menu" data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名计划')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
       ${open ? `<div class="plan-menu" data-plan-menu role="menu" aria-label="计划操作">
         <button class="plan-menu-item" role="menuitem" data-action="move-plan" data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
-        <button class="plan-menu-item" role="menuitem" data-action="move-plan" data-id="${item.id}" data-dir="down" ${index === state.plans.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="move-plan" data-id="${item.id}" data-dir="down" ${index === visible.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="flat-open-move-menu" data-collection="plans" data-id="${item.id}" aria-haspopup="menu" aria-expanded="${flatState('plans').moveMenuOpenId === item.id}"><i data-lucide="folder-output"></i>移动到分类</button>
+        ${renderFlatMoveSubmenu('plans', item)}
         <button class="plan-menu-item danger" role="menuitem" data-action="delete-plan" data-id="${item.id}"><i data-lucide="trash-2"></i>删除计划</button>
       </div>` : ''}
     </div>
@@ -1270,13 +1736,13 @@ function renderPlanEditor(plan) {
       <div class="plan-field-head">
         <label for="planDescription">具体计划</label>
       </div>
-      <textarea class="plan-next-step plan-editor" id="planDescription" placeholder="例如：周五前整理第一版方案，并发给对方确认。" aria-label="具体计划">${escapeHtml(plan.description)}</textarea>
+      ${richEditorMarkup({ key: `plan:${plan.id}:description`, legacyId: 'planDescription', legacyClass: 'plan-next-step', getItem: () => plan, blocksKey: 'descriptionBlocks', textKey: 'description', label: '具体计划', placeholder: '例如：周五前整理第一版方案，并发给对方确认。', onChange: () => { schedulePlanSave(); syncPlanListRow(plan.id); } })}
     </section>
     <section class="plan-field note-field">
       <div class="plan-field-head">
         <label for="planNote">计划笔记</label>
       </div>
-      <textarea class="plan-note plan-editor" id="planNote" placeholder="记录想法、进展、材料和复盘……" aria-label="计划笔记">${escapeHtml(plan.note)}</textarea>
+      ${richEditorMarkup({ key: `plan:${plan.id}:note`, legacyId: 'planNote', legacyClass: 'plan-note', getItem: () => plan, blocksKey: 'noteBlocks', textKey: 'note', label: '计划笔记', placeholder: '记录想法、进展、材料和复盘……', onChange: () => { schedulePlanSave(); syncPlanListRow(plan.id); } })}
     </section>
   </section>`;
 }
@@ -1295,22 +1761,24 @@ function syncPlanListRow(planId) {
   const nameEl = row.querySelector('.plan-name');
   const previewEl = row.querySelector('.plan-preview');
   if (nameEl) nameEl.textContent = plan.name || '未命名计划';
-  if (previewEl) previewEl.textContent = (plan.description || '').trim() || '尚未设置下一步';
+  if (previewEl) previewEl.textContent = richPreview(plan, 'description', 'descriptionBlocks', '尚未设置下一步');
 }
 
 // ---------- 个人模板 ----------
 
 function renderTemplates() {
-  if (!selectedTemplateId && state.templates.length) selectedTemplateId = state.templates[0].id;
+  const visible = flatItemsForFilter('templates');
+  if (!visible.some((item) => item.id === selectedTemplateId)) selectedTemplateId = visible[0]?.id || null;
   const template = currentTemplate();
   $('#app').innerHTML = `<section class="page content-page plans-page">
+    ${renderFlatToolbar('templates')}
     <aside class="plan-rail" aria-label="全部模板">
       <div class="plan-rail-head">
         <div class="plan-rail-title"><h2>全部模板</h2><span class="plan-count">${state.templates.length} 个</span></div>
         <button class="button primary small plan-new" data-action="add-template"><i data-lucide="plus"></i>新建模板</button>
       </div>
       <div class="plan-list">
-        ${state.templates.length ? state.templates.map((item, index) => templateListItem(item, index)).join('') : '<p class="status-text plan-empty-hint">还没有模板。</p>'}
+        ${visible.length ? visible.map((item, index) => templateListItem(item, index, visible)).join('') : '<p class="status-text plan-empty-hint">当前分类还没有模板。</p>'}
       </div>
     </aside>
     <div class="plan-workspace">
@@ -1323,20 +1791,24 @@ function renderTemplates() {
   }));
 }
 
-function templateListItem(item, index) {
+function templateListItem(item, index, visible = state.templates) {
   const open = templateMenuOpenId === item.id;
-  const preview = (item.content || '').trim() || '还没有内容';
+  const preview = richPreview(item, 'content', 'contentBlocks', '还没有内容');
   const active = item.id === selectedTemplateId;
+  const category = flatCategories('templates').find((entry) => entry.id === item.categoryId);
   return `<div class="plan-list-row ${active ? 'active' : ''}" data-id="${item.id}">
     <button class="plan-select" data-action="select-template" data-id="${item.id}" aria-label="选择模板「${escapeHtml(item.name)}」">
       <span class="plan-name">${escapeHtml(item.name || '未命名模板')}</span>
       <span class="plan-preview">${escapeHtml(preview)}</span>
+      <span class="flat-category-label">${escapeHtml(category?.name || '未分类')}</span>
     </button>
     <div class="plan-more-wrap">
       <button class="plan-more" data-action="open-template-menu" data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名模板')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
       ${open ? `<div class="plan-menu" data-template-menu role="menu" aria-label="模板操作">
         <button class="plan-menu-item" role="menuitem" data-action="move-template" data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
-        <button class="plan-menu-item" role="menuitem" data-action="move-template" data-id="${item.id}" data-dir="down" ${index === state.templates.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="move-template" data-id="${item.id}" data-dir="down" ${index === visible.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="flat-open-move-menu" data-collection="templates" data-id="${item.id}" aria-haspopup="menu" aria-expanded="${flatState('templates').moveMenuOpenId === item.id}"><i data-lucide="folder-output"></i>移动到分类</button>
+        ${renderFlatMoveSubmenu('templates', item)}
         <button class="plan-menu-item danger" role="menuitem" data-action="delete-template" data-id="${item.id}"><i data-lucide="trash-2"></i>删除模板</button>
       </div>` : ''}
     </div>
@@ -1353,13 +1825,13 @@ function renderTemplateEditor(template) {
       <div class="plan-field-head">
         <label for="templateContent">模板内容</label>
       </div>
-      <textarea class="plan-next-step template-editor" id="templateContent" placeholder="写下这份模板的固定内容，例如周报结构、复盘框架、常用话术……" aria-label="模板内容">${escapeHtml(template.content)}</textarea>
+      ${richEditorMarkup({ key: `template:${template.id}:content`, legacyId: 'templateContent', legacyClass: 'plan-next-step', getItem: () => template, blocksKey: 'contentBlocks', textKey: 'content', label: '模板内容', placeholder: '写下这份模板的固定内容，例如周报结构、复盘框架、常用话术……', onChange: () => { scheduleTemplateSave(); syncTemplateListRow(template.id); } })}
     </section>
     <section class="plan-field note-field">
       <div class="plan-field-head">
         <label for="templateNote">使用备注</label>
       </div>
-      <textarea class="plan-note template-editor" id="templateNote" placeholder="记录适用场景、使用方法或维护心得……" aria-label="使用备注">${escapeHtml(template.note)}</textarea>
+      ${richEditorMarkup({ key: `template:${template.id}:note`, legacyId: 'templateNote', legacyClass: 'plan-note', getItem: () => template, blocksKey: 'noteBlocks', textKey: 'note', label: '使用备注', placeholder: '记录适用场景、使用方法或维护心得……', onChange: () => { scheduleTemplateSave(); syncTemplateListRow(template.id); } })}
     </section>
   </section>`;
 }
@@ -1378,24 +1850,24 @@ function syncTemplateListRow(templateId) {
   const nameEl = row.querySelector('.plan-name');
   const previewEl = row.querySelector('.plan-preview');
   if (nameEl) nameEl.textContent = template.name || '未命名模板';
-  if (previewEl) previewEl.textContent = (template.content || '').trim() || '还没有内容';
+  if (previewEl) previewEl.textContent = richPreview(template, 'content', 'contentBlocks', '还没有内容');
 }
 
 // ---------- 问题拆解 ----------
 
-function currentProblem() { return state.problems.find((problem) => problem.id === selectedProblemId) || null; }
-
 function renderProblems() {
-  if (!selectedProblemId && state.problems.length) selectedProblemId = state.problems[0].id;
+  const visible = flatItemsForFilter('problems');
+  if (!visible.some((item) => item.id === selectedProblemId)) selectedProblemId = visible[0]?.id || null;
   const problem = currentProblem();
   $('#app').innerHTML = `<section class="page content-page plans-page">
+    ${renderFlatToolbar('problems')}
     <aside class="plan-rail" aria-label="全部问题">
       <div class="plan-rail-head">
         <div class="plan-rail-title"><h2>全部问题</h2><span class="plan-count">${state.problems.length} 个</span></div>
         <button class="button primary small plan-new" data-action="add-problem"><i data-lucide="plus"></i>新建问题</button>
       </div>
       <div class="plan-list">
-        ${state.problems.length ? state.problems.map((item, index) => problemListItem(item, index)).join('') : '<p class="status-text plan-empty-hint">还没有问题。</p>'}
+        ${visible.length ? visible.map((item, index) => problemListItem(item, index, visible)).join('') : '<p class="status-text plan-empty-hint">当前分类还没有问题。</p>'}
       </div>
     </aside>
     <div class="plan-workspace">
@@ -1408,20 +1880,24 @@ function renderProblems() {
   }));
 }
 
-function problemListItem(item, index) {
+function problemListItem(item, index, visible = state.problems) {
   const open = problemMenuOpenId === item.id;
-  const preview = (item.content || '').trim() || '还没有内容';
+  const preview = richPreview(item, 'content', 'contentBlocks', '还没有内容');
   const active = item.id === selectedProblemId;
+  const category = flatCategories('problems').find((entry) => entry.id === item.categoryId);
   return `<div class="plan-list-row ${active ? 'active' : ''}" data-id="${item.id}">
     <button class="plan-select" data-action="select-problem" data-id="${item.id}" aria-label="选择问题「${escapeHtml(item.name)}」">
       <span class="plan-name">${escapeHtml(item.name || '未命名问题')}</span>
       <span class="plan-preview">${escapeHtml(preview)}</span>
+      <span class="flat-category-label">${escapeHtml(category?.name || '未分类')}</span>
     </button>
     <div class="plan-more-wrap">
       <button class="plan-more" data-action="open-problem-menu" data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名问题')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
       ${open ? `<div class="plan-menu" data-problem-menu role="menu" aria-label="问题操作">
         <button class="plan-menu-item" role="menuitem" data-action="move-problem" data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
-        <button class="plan-menu-item" role="menuitem" data-action="move-problem" data-id="${item.id}" data-dir="down" ${index === state.problems.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="move-problem" data-id="${item.id}" data-dir="down" ${index === visible.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="flat-open-move-menu" data-collection="problems" data-id="${item.id}" aria-haspopup="menu" aria-expanded="${flatState('problems').moveMenuOpenId === item.id}"><i data-lucide="folder-output"></i>移动到分类</button>
+        ${renderFlatMoveSubmenu('problems', item)}
         <button class="plan-menu-item danger" role="menuitem" data-action="delete-problem" data-id="${item.id}"><i data-lucide="trash-2"></i>删除问题</button>
       </div>` : ''}
     </div>
@@ -1438,13 +1914,13 @@ function renderProblemEditor(problem) {
       <div class="plan-field-head">
         <label for="problemContent">拆解内容</label>
       </div>
-      <textarea class="plan-note problem-editor" id="problemContent" placeholder="把大问题拆成一个个小步骤，写下下一步能做什么……" aria-label="拆解内容">${escapeHtml(problem.content)}</textarea>
+      ${richEditorMarkup({ key: `problem:${problem.id}:content`, legacyId: 'problemContent', legacyClass: 'plan-next-step', getItem: () => problem, blocksKey: 'contentBlocks', textKey: 'content', label: '拆解内容', placeholder: '把大问题拆成一个个小步骤，写下下一步能做什么……', onChange: () => { scheduleProblemSave(); syncProblemListRow(problem.id); } })}
     </section>
     <section class="plan-field next-step-field">
       <div class="plan-field-head">
         <label for="problemNote">备注</label>
       </div>
-      <textarea class="plan-next-step problem-editor" id="problemNote" placeholder="记录背景、限制或线索……" aria-label="备注">${escapeHtml(problem.note)}</textarea>
+      ${richEditorMarkup({ key: `problem:${problem.id}:note`, legacyId: 'problemNote', legacyClass: 'plan-note', getItem: () => problem, blocksKey: 'noteBlocks', textKey: 'note', label: '备注', placeholder: '记录背景、限制或线索……', onChange: () => { scheduleProblemSave(); syncProblemListRow(problem.id); } })}
     </section>
   </section>`;
 }
@@ -1463,7 +1939,870 @@ function syncProblemListRow(problemId) {
   const nameEl = row.querySelector('.plan-name');
   const previewEl = row.querySelector('.plan-preview');
   if (nameEl) nameEl.textContent = problem.name || '未命名问题';
-  if (previewEl) previewEl.textContent = (problem.content || '').trim() || '还没有内容';
+  if (previewEl) previewEl.textContent = richPreview(problem, 'content', 'contentBlocks', '还没有内容');
+}
+
+// ---------- 分类模板库：渲染与列表 ----------
+
+function libraryTemplatesForFilter(moduleId) {
+  const rt = libraryState(moduleId);
+  const templates = libraryTemplates(moduleId);
+  const categories = libraryCategories(moduleId);
+  if (rt.categoryFilter === 'all') return templates;
+  if (rt.categoryFilter === 'none') return templates.filter((entry) => !entry.categoryId || !categories.some((category) => category.id === entry.categoryId));
+  return templates.filter((entry) => entry.categoryId === rt.categoryFilter);
+}
+
+function libraryCategoryCount(moduleId, categoryId) {
+  const templates = libraryTemplates(moduleId);
+  const categories = libraryCategories(moduleId);
+  if (categoryId === 'all') return templates.length;
+  if (categoryId === 'none') return templates.filter((entry) => !entry.categoryId || !categories.some((category) => category.id === entry.categoryId)).length;
+  return templates.filter((entry) => entry.categoryId === categoryId).length;
+}
+
+function libraryFilterLabel(moduleId) {
+  const rt = libraryState(moduleId);
+  if (rt.categoryFilter === 'all') return '全部分类';
+  if (rt.categoryFilter === 'none') return '未分类';
+  return libraryCategories(moduleId).find((entry) => entry.id === rt.categoryFilter)?.name || '全部分类';
+}
+
+function learningUpdatedLabel(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `更新于 ${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function renderLibraryFilterMenu(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  if (!rt.filterMenuOpen) return '';
+  const rows = [
+    { id: 'all', name: '全部分类' },
+    ...libraryCategories(moduleId).map((entry) => ({ id: entry.id, name: entry.name })),
+    { id: 'none', name: '未分类' },
+  ];
+  const menuAttr = mod.legacyActions
+    ? 'data-learning-filter-menu data-library-filter-menu data-library="learning"'
+    : `data-library-filter-menu data-library="${moduleId}"`;
+  const setFilter = libraryActionName(moduleId, 'set-filter');
+  return `<div class="plan-menu learning-filter-menu" ${menuAttr} role="menu" aria-label="按分类筛选">
+    ${rows.map((row) => `<button class="plan-menu-item ${rt.categoryFilter === row.id ? 'active' : ''}" role="menuitem" data-action="${setFilter}" ${mod.legacyActions ? '' : `data-library="${moduleId}"`} data-filter="${row.id}">
+      <span class="learning-filter-name">${escapeHtml(row.name)}</span>
+      <span class="learning-filter-count">${libraryCategoryCount(moduleId, row.id)}</span>
+    </button>`).join('')}
+    <div class="learning-filter-sep" role="separator"></div>
+    <button class="plan-menu-item" role="menuitem" data-action="${libraryActionName(moduleId, 'open-category-manager')}" ${mod.legacyActions ? '' : `data-library="${moduleId}"`}><i data-lucide="settings-2"></i>管理分类</button>
+  </div>`;
+}
+
+function renderLibraryPage(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  const visible = libraryTemplatesForFilter(moduleId);
+  if (!visible.some((entry) => entry.id === rt.selectedId)) rt.selectedId = visible[0]?.id || null;
+  const template = libraryCurrentTemplate(moduleId);
+  const filtering = rt.categoryFilter !== 'all';
+  const action = (name) => libraryActionName(moduleId, name);
+  const attrs = mod.legacyActions ? '' : `data-library="${moduleId}"`;
+  $('#app').innerHTML = `<section class="page content-page learning-page" data-library="${moduleId}">
+    <div class="learning-toolbar">
+      <button class="button primary small" data-action="${action('add')}" ${attrs}><i data-lucide="plus"></i>新建模板</button>
+      <div class="learning-filter-wrap">
+        <button class="learning-filter-btn ${rt.filterMenuOpen ? 'open' : ''}" data-action="${action('toggle-filter')}" ${attrs} aria-haspopup="menu" aria-expanded="${rt.filterMenuOpen}">
+          <i data-lucide="folder"></i><span>${escapeHtml(libraryFilterLabel(moduleId))}</span><i data-lucide="chevron-down"></i>
+        </button>
+        ${renderLibraryFilterMenu(moduleId)}
+      </div>
+      <button class="button teal small" data-action="${action('add-category')}" ${attrs}><i data-lucide="plus"></i>新建分类</button>
+    </div>
+    <div class="learning-body">
+      <aside class="plan-rail" aria-label="${escapeHtml(mod.eyebrow)}模板列表">
+        <div class="plan-rail-head">
+          <div class="plan-rail-title"><h2>列表</h2><span class="plan-count">${visible.length} 个</span></div>
+        </div>
+        <div class="learning-cards">
+          ${visible.length ? visible.map((item, index) => libraryListItem(moduleId, item, index, visible)).join('') : `<p class="status-text plan-empty-hint">${filtering ? mod.filteredListHint : mod.listHint}</p>`}
+          <button class="learning-card-add" data-action="${action('add')}" ${attrs}><i data-lucide="plus"></i>新建模板</button>
+        </div>
+      </aside>
+      <div class="plan-workspace">
+        ${template ? renderLibraryEditor(moduleId, template) : emptyState(mod.editorIcon, filtering ? '当前分类还没有模板' : mod.emptyTitle, mod.emptyBody, `<button class="button primary" data-action="${action('add')}" ${attrs}><i data-lucide="plus"></i>新建模板</button>`)}
+      </div>
+    </div>
+  </section>`;
+  $$('.learning-editor').forEach((editor) => {
+    editor.addEventListener('input', () => {
+      scheduleLibrarySave(moduleId);
+      syncLibraryListRow(moduleId, libraryState(moduleId).selectedId);
+    });
+  });
+}
+
+function libraryListItem(moduleId, item, index, visible) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  const open = rt.menuOpenId === item.id;
+  const preview = richPreview(item, 'content', 'contentBlocks', '还没有内容');
+  const active = item.id === rt.selectedId;
+  const updated = learningUpdatedLabel(item.updatedAt);
+  const action = libraryActionName(moduleId, 'menu');
+  const attrs = mod.legacyActions ? '' : `data-library="${moduleId}"`;
+  const menuAttr = mod.legacyActions
+    ? 'data-learning-menu data-library-menu data-library="learning"'
+    : `data-library-menu data-library="${moduleId}"`;
+  const moveAction = libraryActionName(moduleId, 'move');
+  const deleteAction = libraryActionName(moduleId, 'delete');
+  return `<div class="plan-list-row learning-card ${active ? 'active' : ''}" data-id="${item.id}">
+    <button class="plan-select" data-action="${libraryActionName(moduleId, 'select')}" ${attrs} data-id="${item.id}" aria-label="选择模板「${escapeHtml(item.name)}」">
+      <span class="plan-name">${escapeHtml(item.name || '未命名模板')}</span>
+      <span class="plan-preview">${escapeHtml(preview)}</span>
+      ${updated ? `<span class="learning-updated">${escapeHtml(updated)}</span>` : ''}
+    </button>
+    <div class="plan-more-wrap">
+      <button class="plan-more" data-action="${action}" ${attrs} data-id="${item.id}" aria-label="「${escapeHtml(item.name || '未命名模板')}」的更多操作" aria-expanded="${open}" aria-haspopup="menu"><i data-lucide="more-horizontal"></i></button>
+      ${open ? `<div class="plan-menu" ${menuAttr} role="menu" aria-label="${escapeHtml(mod.eyebrow)}模板操作">
+        <button class="plan-menu-item" role="menuitem" data-action="${moveAction}" ${attrs} data-id="${item.id}" data-dir="up" ${index === 0 ? 'disabled' : ''}><i data-lucide="arrow-up"></i>上移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="${moveAction}" ${attrs} data-id="${item.id}" data-dir="down" ${index === visible.length - 1 ? 'disabled' : ''}><i data-lucide="arrow-down"></i>下移</button>
+        <button class="plan-menu-item" role="menuitem" data-action="library-open-move-menu" data-library="${moduleId}" data-id="${item.id}" aria-haspopup="menu" aria-expanded="${rt.moveMenuOpenId === item.id}"><i data-lucide="folder-output"></i>移动到分类</button>
+        ${renderLibraryMoveSubmenu(moduleId, item)}
+        <button class="plan-menu-item danger" role="menuitem" data-action="${deleteAction}" ${attrs} data-id="${item.id}"><i data-lucide="trash-2"></i>删除模板</button>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
+function renderLibraryEditor(moduleId, template) {
+  const mod = LIBRARY_MODULES[moduleId];
+  return `<section class="plan-workspace-panel" aria-label="当前${escapeHtml(mod.eyebrow)}模板编辑器">
+    <div class="plan-title-row">
+      <input class="plan-name-input learning-editor" id="${mod.editor.name}" value="${escapeHtml(template.name)}" aria-label="模板标题" placeholder="模板标题" />
+      <span class="plan-save" id="${mod.editor.status}" role="status" aria-live="polite" data-action="${libraryActionName(moduleId, 'retry-save')}" ${mod.legacyActions ? '' : `data-library="${moduleId}"`}>已保存</span>
+    </div>
+    <section class="plan-field next-step-field">
+      <div class="plan-field-head">
+        <label for="${mod.editor.content}">模板内容</label>
+      </div>
+      ${richEditorMarkup({ key: `library:${moduleId}:${template.id}:content`, legacyId: mod.editor.content, legacyClass: 'plan-next-step', getItem: () => template, blocksKey: 'contentBlocks', textKey: 'content', label: '模板内容', placeholder: '写下这份模板的固定内容，例如周报结构、复盘框架、常用话术……', onChange: () => { scheduleLibrarySave(moduleId); syncLibraryListRow(moduleId, template.id); } })}
+    </section>
+    <section class="plan-field note-field">
+      <div class="plan-field-head">
+        <label for="${mod.editor.note}">使用备注</label>
+      </div>
+      ${richEditorMarkup({ key: `library:${moduleId}:${template.id}:note`, legacyId: mod.editor.note, legacyClass: 'plan-note', getItem: () => template, blocksKey: 'noteBlocks', textKey: 'note', label: '使用备注', placeholder: '记录适用场景、使用方法或维护心得……', onChange: () => { scheduleLibrarySave(moduleId); syncLibraryListRow(moduleId, template.id); } })}
+    </section>
+  </section>`;
+}
+
+function setLibraryStatus(moduleId, text, isError = false) {
+  const el = $(`#${LIBRARY_MODULES[moduleId].editor.status}`);
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('save-error', isError);
+}
+
+function syncLibraryListRow(moduleId, templateId) {
+  const template = libraryTemplates(moduleId).find((entry) => entry.id === templateId);
+  const row = $(`.plan-list-row[data-id="${templateId}"]`);
+  if (!template || !row) return;
+  const nameEl = row.querySelector('.plan-name');
+  const previewEl = row.querySelector('.plan-preview');
+  if (nameEl) nameEl.textContent = template.name || '未命名模板';
+  if (previewEl) previewEl.textContent = richPreview(template, 'content', 'contentBlocks', '还没有内容');
+}
+
+function openLibraryCategoryManager(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  rt.filterMenuOpen = false;
+  const renameAction = libraryActionName(moduleId, 'rename-category');
+  const deleteAction = libraryActionName(moduleId, 'delete-category');
+  const addAction = libraryActionName(moduleId, 'add-category');
+  const attrs = mod.legacyActions ? '' : `data-library="${moduleId}"`;
+  const categories = libraryCategories(moduleId);
+  $('#modalEyebrow').textContent = `${mod.eyebrow} · 分类`;
+  $('#modalTitle').textContent = '管理分类';
+  $('#modalBody').innerHTML = `<div class="thought-category-manager">
+    <div class="thought-category-row system"><span>未分类</span><small>系统分类</small></div>
+    ${categories.length ? categories.map((category) => `<div class="thought-category-row">
+      <span>${escapeHtml(category.name)}</span>
+      <div class="row-actions">
+        <button class="mini-button" data-action="${renameAction}" ${attrs} data-id="${category.id}" aria-label="重命名分类${escapeHtml(category.name)}"><i data-lucide="pencil"></i></button>
+        <button class="mini-button danger" data-action="${deleteAction}" ${attrs} data-id="${category.id}" aria-label="删除分类${escapeHtml(category.name)}"><i data-lucide="trash-2"></i></button>
+      </div>
+    </div>`).join('') : '<p class="status-text">还没有自定义分类。</p>'}
+  </div>`;
+  $('#modalActions').innerHTML = `<button class="button ghost" data-modal-cancel>关闭</button><button class="button primary" data-action="${addAction}" ${attrs}><i data-lucide="plus"></i>新建分类</button>`;
+  $('#modalBackdrop').classList.remove('hidden');
+  $('[data-modal-cancel]').onclick = closeModal;
+  renderIcons();
+}
+
+// ---------- 设置：模块归属与排序 ----------
+
+async function openCustomModuleModal() {
+  if (settingsSaving || customCreationPromise || dataRestoreLock || dataReloadRequired) return;
+  if (!(await flushPendingSaves())) return;
+  if (!customCreation || customCreation.phase !== 'unknown') {
+    customCreation = { phase: 'editing', name: '', icon: 'book-open', placement: currentWorkspace, error: '' };
+  }
+  renderCustomModuleModal();
+}
+
+function renderCustomModuleModal() {
+  const entry = customCreation;
+  const submitting = Boolean(customCreationPromise), unknown = entry.phase === 'unknown';
+  const locked = submitting || unknown;
+  $('#modalBackdrop').dataset.customModule = 'true';
+  $('.modal').classList.add('custom-module-modal');
+  $('#modalEyebrow').textContent = '模块管理';
+  $('#modalTitle').textContent = '新增模块';
+  $('#modalClose').disabled = submitting;
+  const iconNames = ['书本', '文件夹', '灯泡', '目标', '星星'];
+  $('#modalBody').innerHTML = `<p class="custom-module-intro">采用与复盘相同的分类和模板布局。</p>
+    <form id="customModuleForm">
+      <div class="field"><label for="customModuleName">模块名称</label><input class="input" id="customModuleName" value="${escapeHtml(entry.name)}" placeholder="例如：读书笔记" aria-describedby="customModuleError" ${locked ? 'disabled' : ''}></div>
+      <fieldset class="custom-module-field"><legend>模块图标</legend><div class="custom-icon-options">
+        ${CustomModuleModel.icons.map((icon, index) => `<label class="custom-icon-option" title="${iconNames[index]}"><input type="radio" name="moduleIcon" value="${icon}" ${entry.icon === icon ? 'checked' : ''} ${locked ? 'disabled' : ''} aria-label="${iconNames[index]}"><span><i data-lucide="${icon}"></i></span></label>`).join('')}
+      </div></fieldset>
+      <fieldset class="custom-module-field"><legend>显示位置</legend><div class="custom-placement-options">
+        ${['main', 'zone'].map((placement) => `<label class="custom-position-option"><input type="radio" name="modulePlacement" value="${placement}" ${entry.placement === placement ? 'checked' : ''} ${locked ? 'disabled' : ''}><span>${WORKSPACE_LABELS[placement]}</span></label>`).join('')}
+      </div></fieldset>
+      <div class="custom-module-info"><strong>模块包含</strong><p>分类管理 · 模板列表 · 模板内容 · 使用备注</p></div>
+      <p id="customModuleError" class="custom-module-error" role="alert">${escapeHtml(entry.error || '')}</p>
+    </form>`;
+  $('#modalActions').innerHTML = `<div class="custom-module-footer"><small>创建后立即保存，可在设置中调整位置和顺序。</small><div>
+    ${entry.conflict ? '<button class="button ghost" id="moduleReload">重新载入最新设置</button>' : ''}
+    <button class="button ghost" id="moduleCancel" ${submitting ? 'disabled' : ''}>${unknown ? '关闭并稍后确认' : '取消'}</button>
+    <button class="button primary" id="moduleCreate" ${submitting || entry.conflict || dataReloadRequired ? 'disabled' : ''}>${submitting ? '创建中…' : unknown ? '确认创建结果' : '创建模块'}</button>
+    </div></div>`;
+  $('#modalBackdrop').classList.remove('hidden');
+  renderIcons();
+  $('#customModuleName').addEventListener('input', (event) => { entry.name = event.target.value; });
+  $$('#customModuleForm input[type="radio"]').forEach((input) => input.addEventListener('change', () => {
+    if (input.name === 'moduleIcon') entry.icon = input.value; else entry.placement = input.value;
+  }));
+  $('#customModuleForm').onsubmit = (event) => { event.preventDefault(); if (!event.isComposing) void submitCustomModule(); };
+  $('#customModuleName').onkeydown = (event) => {
+    if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); void submitCustomModule(); }
+    else if (event.key === 'Enter') event.preventDefault();
+  };
+  $('#moduleCreate').onclick = () => void submitCustomModule();
+  $('#moduleCancel').onclick = () => { closeModal(true); $('#modalClose').disabled = false; };
+  $('#moduleReload')?.addEventListener('click', async () => {
+    if (!confirm('重新载入将放弃尚未保存的排序和归属修改，保留新增模块表单。是否继续？')) return;
+    try {
+      const result = await api('GET', '/api/navigation/preferences');
+      if (!applyNavigationSnapshot(result)) return;
+      initSettingsDraft(); entry.conflict = false; entry.error = ''; render(); renderCustomModuleModal();
+    } catch (error) { entry.error = error.message; renderCustomModuleModal(); }
+  });
+  $('.custom-module-modal').onkeydown = trapCustomModuleFocus;
+  if (!locked) $('#customModuleName').focus(); else $('#moduleCreate').focus();
+}
+
+function trapCustomModuleFocus(event) {
+  if (event.key !== 'Tab') return;
+  const fields = $$('button:not(:disabled), input:not(:disabled)', $('.custom-module-modal')).filter((entry) => entry.getClientRects().length);
+  const first = fields[0], last = fields[fields.length - 1];
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+}
+
+async function submitCustomModule() {
+  if (customCreationPromise || settingsSaving || dataRestoreLock || dataReloadRequired || !customCreation || customCreation.conflict) return;
+  const entry = customCreation;
+  if (entry.phase !== 'unknown') {
+    const error = CustomModuleModel.nameError(entry.name, state.customModules || []);
+    if (error) { entry.error = error; renderCustomModuleModal(); return; }
+    entry.payload = { name: entry.name.trim(), icon: entry.icon, placement: entry.placement, baseRevision: settingsBaseRevision, requestId: crypto.randomUUID() };
+    entry.generation = settingsGeneration;
+    entry.epoch = dataEpoch;
+  }
+  entry.phase = 'submitting'; entry.error = '';
+  // Promise赋值后才开始UI/请求，保证同步双击只进入一次。
+  customCreationPromise = Promise.resolve().then(async () => {
+    render(); renderCustomModuleModal();
+    try {
+      const result = await api('POST', '/api/custom-modules', entry.payload);
+      if (entry.epoch !== dataEpoch || !applyNavigationSnapshot(result)) throw Object.assign(new Error('数据已变化，请重新载入'), { code: 'DATA_EPOCH_CHANGED' });
+      const ownRevision = result.navigationPreferences.revision === result.appliedRevision && result.appliedRevision === entry.payload.baseRevision + 1;
+      if (ownRevision) {
+        // 确认旧请求时只更新当前草稿，绝不恢复已被放弃的旧排序/归属。
+        if (currentView === 'settings' && settingsDraft) {
+          if (!settingsDraft.moduleOrder.includes(result.module.id)) settingsDraft.moduleOrder.push(result.module.id);
+          settingsDraft.placementByModule[result.module.id] = entry.payload.placement;
+          settingsBaseRevision = result.navigationPreferences.revision;
+          settingsDirty = settingsDraftChanged();
+        }
+        settingsStatus = { text: '模块已创建', error: false };
+      } else {
+        settingsStatus = { text: '模块已创建，但设置已在其他页面更新，请重新载入最新设置。', error: true };
+      }
+      entry.phase = 'success';
+      closeModal(true); $('#modalClose').disabled = false;
+      customCreation = null;
+      render(); toast(settingsStatus.text, !ownRevision);
+      if (!ownRevision && currentView === 'settings') openSettingsConflictModal({});
+    } catch (error) {
+      entry.error = error.message;
+      if (error.code === 'DATA_EPOCH_CHANGED') {
+        entry.phase = 'unknown'; entry.error = '数据已变化。请保留输入并确认重新载入，不能自动重复创建。';
+      } else if (error.commitState === 'not_committed' || (error.status >= 400 && error.status < 500)) {
+        entry.phase = 'editing'; entry.conflict = error.code === 'NAVIGATION_REVISION_CONFLICT';
+      } else {
+        entry.phase = 'unknown'; entry.error = '创建结果尚未确认，模块可能已经保存。请确认创建结果。';
+      }
+    }
+  }).finally(() => {
+    customCreationPromise = null;
+    render();
+    if (customCreation === entry && !$('#modalBackdrop').classList.contains('hidden')) renderCustomModuleModal();
+  });
+  return customCreationPromise;
+}
+
+function initSettingsDraft() {
+  settingsGeneration += 1;
+  const prefs = navigationPreferences;
+  settingsDraft = { moduleOrder: [...prefs.moduleOrder], placementByModule: { ...prefs.placementByModule } };
+  settingsBaseRevision = prefs.revision;
+  settingsDirty = false;
+  settingsStatus = { text: '', error: false };
+}
+
+function settingsDraftChanged() {
+  return JSON.stringify(settingsDraft.moduleOrder) !== JSON.stringify(navigationPreferences.moduleOrder)
+    || JSON.stringify(settingsDraft.placementByModule) !== JSON.stringify(navigationPreferences.placementByModule);
+}
+
+// 拖动与箭头共用的唯一移动函数：直接作用于草稿的全局有序数组
+function moveModuleInDraft(moduleId, targetIndex) {
+  const order = settingsDraft.moduleOrder;
+  const from = order.indexOf(moduleId);
+  if (from < 0) return;
+  const to = Math.max(0, Math.min(order.length - 1, targetIndex));
+  if (from === to) return;
+  order.splice(to, 0, ...order.splice(from, 1));
+  markSettingsDirty();
+}
+
+function markSettingsDirty() {
+  settingsDirty = settingsDraftChanged();
+  render();
+}
+
+const TRASH_HINT = '移入垃圾站后可以恢复，彻底清空才会从这台电脑删除。';
+
+function trashKindLabel(kind) {
+  return {
+    module: '模块', record: '内容', category: '分类', drawing: '画布', image: '图片',
+    reflection: '每日反思', framework: '反思问题', 'principle-section': '原则',
+    'principle-item': '原则条目', 'principle-child': '原则子节点',
+  }[kind] || '内容';
+}
+
+function renderTrashCard(saving) {
+  const rows = trashEntries.length
+    ? trashEntries.map((entry) => `<div class="trash-row">
+        <div><strong>${escapeHtml(entry.title || '未命名')}</strong><small>${trashKindLabel(entry.kind)} · ${escapeHtml(new Date(entry.deletedAt).toLocaleString('zh-CN', { hour12: false }))}</small></div>
+        <div class="row-actions">
+          <button class="button ghost small" data-action="trash-restore" data-id="${entry.id}" ${saving ? 'disabled' : ''}>恢复</button>
+          <button class="mini-button danger" data-action="trash-purge" data-id="${entry.id}" ${saving ? 'disabled' : ''} aria-label="彻底删除${escapeHtml(entry.title || '这条内容')}"><i data-lucide="trash-2"></i></button>
+        </div>
+      </div>`).join('')
+    : '<p class="status-text">垃圾站是空的。删除的模块和内容会放在这里，不再占用正在使用的数据。</p>';
+  return `<section class="settings-card trash-card">
+    <div class="settings-head">
+      <div class="settings-heading-row"><h2>垃圾站</h2>${trashEntries.length ? `<button class="button ghost" data-action="trash-empty" ${saving ? 'disabled' : ''}>清空垃圾站</button>` : ''}</div>
+      <p>这里的内容不在日常页面和活动数据里。恢复后回到原处；彻底删除或清空后，才会从这台电脑消失。</p>
+    </div>
+    <div class="trash-list">${rows}</div>
+  </section>`;
+}
+
+function renderBackupCard() {
+  const backupRows = state.backups.length
+    ? state.backups.map((backup) => `<li><div><strong>${new Date(backup.createdAt).toLocaleString('zh-CN', { hour12: false })}</strong><small>${backup.imageCount ? `包含 ${backup.imageCount} 张图片` : '不含图片'} · ${backup.drawingCount || 0} 张图稿${backup.label === 'before-restore' ? ' · 恢复前自动保存' : ''}</small></div><button class="button ghost small" data-action="restore-backup" data-id="${backup.id}"><i data-lucide="history"></i>恢复</button></li>`).join('')
+    : '<p class="status-text">还没有备份。</p>';
+  return `<section class="settings-card trash-card">
+    <div class="settings-head">
+      <div class="settings-heading-row"><h2>数据备份</h2><button class="button ghost" data-action="create-backup"><i data-lucide="archive"></i>立即备份</button></div>
+      <p>备份保存在这台电脑，包含记录、图片、图稿和垃圾站。不依赖某个模块是否还在导航里。</p>
+    </div>
+    <ul class="backup-list">${backupRows}</ul>
+  </section>`;
+}
+
+function renderSettingsPage() {
+  const order = settingsDraft.moduleOrder;
+  const placement = settingsDraft.placementByModule;
+  const saving = Boolean(settingsSaving || customCreationPromise || dataRestoreLock);
+  const rows = order.map((id, index) => {
+    const module = moduleById(id);
+    if (!module) return '';
+    const current = placement[id] === 'main';
+    return `<div class="settings-row" data-module-id="${id}" data-row-index="${index}">
+      <button class="drag-handle" data-drag-handle aria-label="拖动调整「${escapeHtml(module.name)}」的顺序" ${saving ? 'disabled' : ''}><i data-lucide="grip-vertical"></i></button>
+      <span class="settings-module-icon"><i data-lucide="${module.icon}"></i></span>
+      <span class="settings-module-name" title="${escapeHtml(module.name)}">${escapeHtml(module.name)}</span>
+      <div class="placement-segment" role="group" aria-label="「${escapeHtml(module.name)}」的显示位置">
+        <button class="placement-btn ${current ? 'active' : ''}" data-action="settings-placement" data-module-id="${id}" data-placement="main" ${saving ? 'disabled' : ''}>当前</button>
+        <button class="placement-btn ${!current ? 'active' : ''}" data-action="settings-placement" data-module-id="${id}" data-placement="zone" ${saving ? 'disabled' : ''}>专区</button>
+      </div>
+      <div class="row-actions">
+        <button class="mini-button" data-action="settings-move" data-module-id="${id}" data-dir="up" ${index === 0 || saving ? 'disabled' : ''} aria-label="上移「${escapeHtml(module.name)}」"><i data-lucide="arrow-up"></i></button>
+        <button class="mini-button" data-action="settings-move" data-module-id="${id}" data-dir="down" ${index === order.length - 1 || saving ? 'disabled' : ''} aria-label="下移「${escapeHtml(module.name)}」"><i data-lucide="arrow-down"></i></button>
+        <button class="mini-button danger" data-action="settings-delete-module" data-module-id="${id}" ${saving ? 'disabled' : ''} aria-label="删除模块「${escapeHtml(module.name)}」"><i data-lucide="trash-2"></i></button>
+      </div>
+    </div>`;
+  }).join('');
+  $('#app').innerHTML = `<section class="page content-page settings-page ${saving ? 'settings-saving' : ''}">
+    <div class="settings-card">
+      <div class="settings-head">
+        <div class="settings-heading-row"><h2>模块管理</h2><button class="button primary" data-action="custom-module-open" id="addCustomModule" ${saving || dataReloadRequired ? 'disabled' : ''}><i data-lucide="plus"></i>${customCreation?.phase === 'unknown' ? '确认创建结果' : '新增模块'}</button></div>
+        <p>拖动手柄或使用箭头调整顺序；选择每个模块的显示位置。顺序与归属保存后立即生效。</p>
+        <p>新增模块将采用与复盘相同的分类和模板布局。</p>
+      </div>
+      <div class="settings-rows" id="settingsRows">${rows}</div>
+      <div class="settings-foot">
+        <span class="settings-status ${settingsStatus.error ? 'error' : ''}" id="settingsStatus" role="status" aria-live="polite">${escapeHtml(saving ? '正在保存设置…' : settingsStatus.text)}</span>
+        <div class="settings-actions">
+          <button class="button ghost" data-action="settings-cancel" id="settingsCancel" ${saving ? 'disabled' : ''}>取消</button>
+          <button class="button primary" data-action="settings-save" id="settingsSave" ${saving || !settingsDirty || customCreation?.phase === 'unknown' || dataReloadRequired ? 'disabled' : ''}>${saving ? '处理中…' : '保存设置'}</button>
+        </div>
+      </div>
+    </div>
+    ${renderTrashCard(saving)}
+    ${renderBackupCard()}
+    ${MODULE_IDS.includes('principles') ? '<p class="settings-links">原则条目和打卡记录仍在「原则打卡 → 原则管理」，<button class="text-button" data-action="open-principle-manage">前往原则管理</button>。</p>' : ''}
+  </section>`;
+  if (!saving) bindSettingsDrag();
+}
+
+// 拖动只从手柄开始；释放在有效行后提交草稿变更，释放到表格外或 Esc 取消本次拖动
+function bindSettingsDrag() {
+  const container = $('#settingsRows');
+  if (!container) return;
+  let draggingId = null;
+  let dropTargetIndex = null;
+  container.querySelectorAll('.settings-row').forEach((row) => {
+    const handle = row.querySelector('[data-drag-handle]');
+    if (!handle) return;
+    handle.addEventListener('pointerdown', () => { row.draggable = true; });
+    row.addEventListener('mouseup', () => { row.draggable = false; });
+    row.addEventListener('dragstart', (event) => {
+      draggingId = row.dataset.moduleId;
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', draggingId);
+      row.classList.add('dragging');
+    });
+    row.addEventListener('dragend', () => {
+      row.draggable = false;
+      row.classList.remove('dragging');
+      container.querySelectorAll('.settings-row').forEach((target) => target.classList.remove('drop-above', 'drop-below'));
+      draggingId = null;
+      dropTargetIndex = null;
+    });
+    row.addEventListener('dragover', (event) => {
+      if (!draggingId || draggingId === row.dataset.moduleId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      const rect = row.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      dropTargetIndex = before ? Number(row.dataset.rowIndex) : Number(row.dataset.rowIndex) + 1;
+      container.querySelectorAll('.settings-row').forEach((target) => target.classList.remove('drop-above', 'drop-below'));
+      row.classList.add(before ? 'drop-above' : 'drop-below');
+    });
+    row.addEventListener('drop', (event) => {
+      if (!draggingId || dropTargetIndex === null) return;
+      event.preventDefault();
+      const from = settingsDraft.moduleOrder.indexOf(draggingId);
+      // 插入目标按移除拖拽行后的位置计算
+      const target = from < dropTargetIndex ? dropTargetIndex - 1 : dropTargetIndex;
+      moveModuleInDraft(draggingId, target);
+    });
+  });
+}
+
+async function saveSettings() {
+  if (customCreationPromise) await customCreationPromise;
+  if (dataReloadRequired || customCreation?.phase === 'unknown') { toast('请先确认创建结果或重新载入数据', true); return false; }
+  if (settingsSaving) return settingsSaving;
+  if (!settingsDraftChanged()) { settingsDirty = false; render(); return true; }
+  settingsStatus = { text: '', error: false };
+  settingsSaving = (async () => {
+    render(); // 锁定编辑与按钮，显示保存中
+    try {
+      const result = await api('PATCH', '/api/navigation/preferences', {
+        baseRevision: settingsBaseRevision,
+        moduleOrder: settingsDraft.moduleOrder,
+        placementByModule: settingsDraft.placementByModule,
+      });
+      if (!applyNavigationSnapshot(result)) return false;
+      initSettingsDraft();
+      settingsStatus = { text: '设置已保存', error: false };
+      toast('设置已保存');
+      render();
+      return true;
+    } catch (error) {
+      if (error.status === 409 && error.code !== 'DATA_EPOCH_CHANGED') {
+        openSettingsConflictModal(error);
+      } else {
+        settingsStatus = { text: `保存失败：${error.message}`, error: true };
+        toast(error.message, true);
+      }
+      render();
+      return false;
+    } finally {
+      settingsSaving = null;
+      render();
+    }
+  })();
+  return settingsSaving;
+}
+
+// 409 冲突：先确认放弃当前草稿，再读取最新配置；不能仅改 baseRevision 重发旧草稿
+function openSettingsConflictModal(error) {
+  $('#modalEyebrow').textContent = '设置冲突';
+  $('#modalTitle').textContent = '模块设置已在其他页面更新';
+  $('#modalBody').innerHTML = `<p class="modal-message">另一处保存的模块设置比当前草稿更新。重新载入会放弃本页未保存的修改；也可以继续留在本页查看原草稿。</p>`;
+  $('#modalActions').innerHTML = '<button class="button ghost" data-modal-cancel>继续编辑</button><button class="button primary" id="modalSubmit">重新载入最新设置</button>';
+  $('#modalBackdrop').classList.remove('hidden');
+  renderIcons();
+  $('#modalSubmit').onclick = async () => {
+    $('#modalSubmit').disabled = true;
+    try {
+      const result = await api('GET', '/api/navigation/preferences');
+      if (!applyNavigationSnapshot(result)) return;
+      initSettingsDraft();
+      closeModal();
+      render();
+      toast('已重新载入最新设置');
+    } catch (loadError) {
+      toast(loadError.message, true);
+      $('#modalSubmit').disabled = false;
+    }
+  };
+  $('[data-modal-cancel]').onclick = closeModal;
+}
+
+// 草稿未保存时尝试离开：保存并继续 / 放弃更改 / 继续编辑
+function openLeaveSettingsModal(leave) {
+  $('#modalEyebrow').textContent = '设置未保存';
+  $('#modalTitle').textContent = '模块设置还未保存';
+  $('#modalBody').innerHTML = `<p class="modal-message">当前调整的模块顺序与归属尚未保存。可以保存后继续，或放弃这些更改。</p>`;
+  $('#modalActions').innerHTML = '<button class="button ghost" id="settingsKeepEditing">继续编辑</button><button class="button ghost" id="settingsDiscard">放弃更改</button><button class="button primary" id="settingsSaveAndGo">保存并继续</button>';
+  $('#modalBackdrop').classList.remove('hidden');
+  renderIcons();
+  $('#settingsKeepEditing').onclick = () => { closeModal(); };
+  $('#settingsDiscard').onclick = async () => {
+    initSettingsDraft();
+    closeModal();
+    await leave();
+  };
+  $('#settingsSaveAndGo').onclick = async () => {
+    const saved = await saveSettings();
+    if (saved) { closeModal(); await leave(); }
+    else { closeModal(); } // 保存失败留在设置页，保留草稿
+  };
+  $('[data-modal-cancel]')?.addEventListener('click', closeModal, { once: true });
+}
+
+// ---------- 分类模板库：操作（新建/选择/排序/删除/筛选/分类管理） ----------
+
+async function handleLibraryAction(button) {
+  const moduleId = button.dataset.library;
+  if (!LIBRARY_MODULES[moduleId]) return;
+  const action = button.dataset.action;
+  if (action === 'library-add') return libraryAddTemplate(moduleId);
+  if (action === 'library-select') return librarySelectTemplate(moduleId, button.dataset.id);
+  if (action === 'library-menu') return libraryToggleMenu(moduleId, button.dataset.id);
+  if (action === 'library-open-move-menu') {
+    const rt = libraryState(moduleId);
+    rt.moveMenuOpenId = rt.moveMenuOpenId === button.dataset.id ? null : button.dataset.id;
+    render();
+    return;
+  }
+  if (action === 'library-move-category') return libraryMoveCategory(moduleId, button.dataset.id, button.dataset.categoryId);
+  if (action === 'library-retry-save') return libraryRetrySave(moduleId);
+  if (action === 'library-move') return libraryMoveTemplate(moduleId, button.dataset.id, button.dataset.dir);
+  if (action === 'library-delete') return libraryDeleteTemplate(moduleId, button.dataset.id);
+  if (action === 'library-toggle-filter') return libraryToggleFilterMenu(moduleId);
+  if (action === 'library-set-filter') return librarySetFilter(moduleId, button.dataset.filter);
+  if (action === 'library-add-category') return libraryAddCategory(moduleId);
+  if (action === 'library-open-category-manager') {
+    render();
+    openLibraryCategoryManager(moduleId);
+    return;
+  }
+  if (action === 'library-rename-category') return libraryRenameCategory(moduleId, button.dataset.id);
+  if (action === 'library-delete-category') return libraryDeleteCategory(moduleId, button.dataset.id);
+}
+
+async function handleFlatAction(button) {
+  const collection = button.dataset.collection;
+  const config = flatConfig(collection);
+  if (!config) return;
+  const action = button.dataset.action;
+  const rt = flatState(collection);
+  if (action === 'flat-toggle-filter') { rt.filterMenuOpen = !rt.filterMenuOpen; render(); return; }
+  if (action === 'flat-set-filter') {
+    if (rt.categoryFilter === button.dataset.filter) { rt.filterMenuOpen = false; render(); return; }
+    if (!(await flushPendingSaves())) return;
+    rt.categoryFilter = button.dataset.filter || 'all'; rt.filterMenuOpen = false; rt.moveMenuOpenId = null; render(); return;
+  }
+  if (action === 'flat-open-move-menu') { rt.moveMenuOpenId = rt.moveMenuOpenId === button.dataset.id ? null : button.dataset.id; render(); return; }
+  if (action === 'flat-move-category') return flatMoveItem(collection, button.dataset.id, button.dataset.categoryId);
+  if (action === 'flat-add-category') return flatAddCategory(collection);
+  if (action === 'flat-open-category-manager') { rt.filterMenuOpen = false; renderFlatCategoryManager(collection); return; }
+  if (action === 'flat-rename-category') return flatRenameCategory(collection, button.dataset.id);
+  if (action === 'flat-delete-category') return flatDeleteCategory(collection, button.dataset.id);
+}
+
+async function libraryMoveCategory(moduleId, templateId, rawCategoryId) {
+  const mod = LIBRARY_MODULES[moduleId], rt = libraryState(moduleId);
+  const template = libraryTemplates(moduleId).find((entry) => entry.id === templateId);
+  if (!template) return;
+  const categoryId = rawCategoryId === 'none' || !rawCategoryId ? null : rawCategoryId;
+  if ((template.categoryId || null) === categoryId) { rt.moveMenuOpenId = null; render(); return; }
+  if (!(await flushLibrarySave(moduleId))) return;
+  const result = await api('PATCH', `${mod.apiTemplates}/${templateId}`, { categoryId });
+  const index = libraryTemplates(moduleId).findIndex((entry) => entry.id === templateId);
+  if (index >= 0 && result.template) libraryTemplates(moduleId)[index] = result.template;
+  rt.moveMenuOpenId = null; rt.menuOpenId = null;
+  const visible = libraryTemplatesForFilter(moduleId);
+  if (!visible.some((entry) => entry.id === rt.selectedId)) rt.selectedId = visible[0]?.id || null;
+  render();
+  toast(categoryId ? '已移动到新分类' : '已移到未分类');
+}
+
+function renderLibraryMoveSubmenu(moduleId, item) {
+  const rt = libraryState(moduleId);
+  if (rt.moveMenuOpenId !== item.id) return '';
+  const current = item.categoryId || 'none';
+  const rows = [{ id: 'none', name: '未分类' }, ...libraryCategories(moduleId).map((category) => ({ id: category.id, name: category.name }))];
+  return `<div class="flat-category-submenu" data-library-move-menu="${moduleId}" role="menu" aria-label="移动到分类">
+    <div class="flat-category-submenu-title">移动到分类</div>
+    ${rows.map((row) => `<button class="plan-menu-item ${current === row.id ? 'active' : ''}" role="menuitem" data-action="library-move-category" data-library="${moduleId}" data-id="${item.id}" data-category-id="${escapeHtml(row.id)}"><span class="learning-filter-name">${escapeHtml(row.name)}</span>${current === row.id ? '<span aria-hidden="true">✓</span>' : ''}</button>`).join('')}
+  </div>`;
+}
+
+async function flatMoveItem(collection, itemId, rawCategoryId) {
+  const config = flatConfig(collection), rt = flatState(collection);
+  const item = flatItems(collection).find((entry) => entry.id === itemId);
+  if (!item) return;
+  const categoryId = rawCategoryId === 'none' || !rawCategoryId ? null : rawCategoryId;
+  if ((item.categoryId || null) === categoryId) { rt.moveMenuOpenId = null; render(); return; }
+  if (!(await flushPendingSaves())) return;
+  const result = await api('PATCH', `${config.addEndpoint}/${itemId}`, { categoryId });
+  const key = collection === 'plans' ? 'plan' : collection === 'templates' ? 'template' : 'problem';
+  const updated = result[key];
+  const list = flatItems(collection), index = list.findIndex((entry) => entry.id === itemId);
+  if (index >= 0 && updated) list[index] = updated;
+  rt.moveMenuOpenId = null;
+  planMenuOpenId = null; templateMenuOpenId = null; problemMenuOpenId = null;
+  const visible = flatItemsForFilter(collection);
+  if (!visible.some((entry) => entry.id === flatSelectedId(collection))) setFlatSelectedId(collection, visible[0]?.id || null);
+  render();
+  toast(categoryId ? '已移动到新分类' : '已移到未分类');
+}
+
+async function flatMoveOrder(collection, itemId, direction) {
+  const config = flatConfig(collection), visible = flatItemsForFilter(collection), index = visible.findIndex((item) => item.id === itemId);
+  const target = direction === 'up' ? index - 1 : index + 1;
+  if (index < 0 || target < 0 || target >= visible.length) return;
+  if (!(await flushPendingSaves())) return;
+  const ordered = visible.slice();
+  [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+  const result = await api('POST', config.reorderEndpoint, { orderedIds: ordered.map((item) => item.id) });
+  state[config.itemsKey] = result[config.responseKey];
+  planMenuOpenId = null; templateMenuOpenId = null; problemMenuOpenId = null;
+  flatState(collection).moveMenuOpenId = null;
+  render();
+}
+
+function flatAddCategory(collection) {
+  const config = flatConfig(collection);
+  openFormModal({ eyebrow: `${config.itemLabel} · 分类`, title: '新建分类', label: '分类名称', placeholder: '例如：工作、生活、长期方向', submitText: '新建分类', onSubmit: async (name) => {
+    const result = await api('POST', `${config.addEndpoint}/categories`, { name });
+    flatCategories(collection).push(result.category);
+    render();
+  } });
+}
+
+function flatRenameCategory(collection, categoryId) {
+  const config = flatConfig(collection), category = flatCategories(collection).find((entry) => entry.id === categoryId);
+  if (!category) return;
+  openFormModal({ eyebrow: `${config.itemLabel} · 分类`, title: '重命名分类', label: '分类名称', value: category.name, onSubmit: async (name) => {
+    const result = await api('PATCH', `${config.addEndpoint}/categories/${category.id}`, { name });
+    category.name = result.category.name;
+    render();
+  } });
+}
+
+function flatDeleteCategory(collection, categoryId) {
+  const config = flatConfig(collection), rt = flatState(collection), category = flatCategories(collection).find((entry) => entry.id === categoryId);
+  if (!category) return;
+  const count = flatItems(collection).filter((item) => item.categoryId === category.id).length;
+  openConfirmModal({ title: `删除分类「${category.name}」？`, message: `${count} 个相关${config.itemLabel}会转入“未分类”，内容本身不会删除。`, confirmText: '删除分类', onConfirm: async () => {
+    await api('DELETE', `${config.addEndpoint}/categories/${category.id}`);
+    state[config.categoriesKey] = flatCategories(collection).filter((entry) => entry.id !== category.id);
+    flatItems(collection).forEach((item) => { if (item.categoryId === category.id) item.categoryId = null; });
+    if (rt.categoryFilter === category.id) rt.categoryFilter = 'all';
+    render();
+  } });
+}
+
+async function libraryAddTemplate(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  // 新建会替换编辑器，先提交当前输入
+  if (!(await flushLibrarySave(moduleId))) return;
+  const categoryId = rt.categoryFilter !== 'all' && rt.categoryFilter !== 'none' ? rt.categoryFilter : null;
+  const categoryName = categoryId ? libraryCategories(moduleId).find((entry) => entry.id === categoryId)?.name : null;
+  openFormModal({
+    eyebrow: categoryName ? `${mod.eyebrow} · ${categoryName}` : mod.eyebrow,
+    title: mod.legacyActions ? '新建学习模板' : '新建模板',
+    label: '模板名称',
+    placeholder: mod.newPlaceholder,
+    submitText: '建立模板',
+    onSubmit: async (name) => {
+      const result = await api('POST', mod.apiTemplates, { name, categoryId });
+      libraryTemplates(moduleId).push(result.template);
+      rt.selectedId = result.template.id;
+      rt.menuOpenId = null;
+      render();
+      requestAnimationFrame(() => { const input = $(`#${mod.editor.name}`); if (input) input.focus(); });
+    },
+  });
+}
+
+async function librarySelectTemplate(moduleId, templateId) {
+  const rt = libraryState(moduleId);
+  if (rt.selectedId === templateId) {
+    if (rt.menuOpenId) { rt.menuOpenId = null; render(); }
+    return;
+  }
+  // 修复快速切换：先提交当前模板输入，失败则不切换
+  if (!(await flushLibrarySave(moduleId))) return;
+  rt.selectedId = templateId;
+  rt.menuOpenId = null;
+  render();
+}
+
+function libraryToggleMenu(moduleId, templateId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  rt.menuOpenId = rt.menuOpenId === templateId ? null : templateId;
+  rt.moveMenuOpenId = null;
+  render();
+  const action = libraryActionName(moduleId, 'menu');
+  const toggle = $(`[data-action="${action}"][data-id="${templateId}"]`);
+  if (toggle) toggle.focus();
+}
+
+async function libraryRetrySave(moduleId) {
+  const rt = libraryState(moduleId);
+  const snapshot = rt.retry;
+  if (!snapshot) return;
+  setLibraryStatus(moduleId, '正在保存…');
+  clearTimeout(rt.timer);
+  rt.timer = null;
+  await persistLibrarySnapshot(snapshot);
+}
+
+async function libraryMoveTemplate(moduleId, templateId, direction) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  rt.menuOpenId = null;
+  const visible = libraryTemplatesForFilter(moduleId);
+  const index = visible.findIndex((item) => item.id === templateId);
+  const target = direction === 'up' ? index - 1 : index + 1;
+  if (index < 0 || target < 0 || target >= visible.length) return;
+  const ordered = visible.slice();
+  [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+  const result = await api('POST', `${mod.apiTemplates}/reorder`, { orderedIds: ordered.map((item) => item.id) });
+  setLibraryTemplates(moduleId, result.templates);
+  render();
+}
+
+function libraryDeleteTemplate(moduleId, templateId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  const template = libraryTemplates(moduleId).find((item) => item.id === templateId);
+  if (!template) return;
+  openConfirmModal({ title: `删除「${template.name}」？`, message: `模板内容和备注会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
+    if (rt.selectedId === template.id && !(await flushPendingSaves())) throw new Error('模板尚未保存成功，请重试后再删除');
+    const visibleIndex = libraryTemplatesForFilter(moduleId).findIndex((item) => item.id === template.id);
+    const index = libraryTemplates(moduleId).findIndex((item) => item.id === template.id);
+    await api('DELETE', `${mod.apiTemplates}/${template.id}`);
+    if (rt.retry?.templateId === template.id) rt.retry = null;
+    setLibraryTemplates(moduleId, libraryTemplates(moduleId).filter((item) => item.id !== template.id));
+    // 选中同筛选下相邻可用项；筛选为空时由渲染函数回到空状态
+    const nextVisible = libraryTemplatesForFilter(moduleId);
+    const next = nextVisible[Math.min(Math.max(visibleIndex, 0), nextVisible.length - 1)] || libraryTemplates(moduleId)[Math.min(Math.max(index, 0), libraryTemplates(moduleId).length - 1)];
+    rt.selectedId = next?.id || null;
+    rt.menuOpenId = null;
+    rt.moveMenuOpenId = null;
+    render();
+  } });
+}
+
+function libraryToggleFilterMenu(moduleId) {
+  const rt = libraryState(moduleId);
+  rt.filterMenuOpen = !rt.filterMenuOpen;
+  render();
+}
+
+async function librarySetFilter(moduleId, filter) {
+  const rt = libraryState(moduleId);
+  if (rt.categoryFilter === filter) {
+    if (rt.filterMenuOpen) { rt.filterMenuOpen = false; render(); }
+    return;
+  }
+  // 换分类前先提交当前输入
+  if (!(await flushLibrarySave(moduleId))) return;
+  rt.categoryFilter = filter || 'all';
+  rt.filterMenuOpen = false;
+  render();
+}
+
+function libraryAddCategory(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  openFormModal({ eyebrow: `${mod.eyebrow} · 分类`, title: '新建分类', label: '分类名称', placeholder: mod.categoryPlaceholder, submitText: '新建分类', onSubmit: async (name) => {
+    const result = await api('POST', mod.apiCategories, { name });
+    libraryCategories(moduleId).push(result.category);
+    render();
+  } });
+}
+
+function libraryRenameCategory(moduleId, categoryId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const category = libraryCategories(moduleId).find((entry) => entry.id === categoryId);
+  if (!category) return;
+  openFormModal({ eyebrow: `${mod.eyebrow} · 分类`, title: '重命名分类', label: '分类名称', value: category.name, onSubmit: async (name) => {
+    const result = await api('PATCH', `${mod.apiCategories}/${category.id}`, { name });
+    category.name = result.category.name;
+    render();
+  } });
+}
+
+function libraryDeleteCategory(moduleId, categoryId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  const category = libraryCategories(moduleId).find((entry) => entry.id === categoryId);
+  if (!category) return;
+  const count = libraryTemplates(moduleId).filter((entry) => entry.categoryId === category.id).length;
+  openConfirmModal({ title: `删除分类「${category.name}」？`, message: `${count} 个相关模板会转入“未分类”，模板本身不会删除。`, confirmText: '删除分类', onConfirm: async () => {
+    await api('DELETE', `${mod.apiCategories}/${category.id}`);
+    setLibraryCategories(moduleId, libraryCategories(moduleId).filter((entry) => entry.id !== category.id));
+    libraryTemplates(moduleId).forEach((entry) => { if (entry.categoryId === category.id) entry.categoryId = null; });
+    if (rt.categoryFilter === category.id) rt.categoryFilter = 'all';
+    render();
+  } });
 }
 
 function collectThoughtSnapshot() {
@@ -1476,7 +2815,7 @@ function collectThoughtSnapshot() {
     title: String(thought.title || ''),
     text: String(thought.text || ''),
     categoryId: thought.categoryId || null,
-    ...(thoughtKind(thought) === 'review' && state.version >= 8 ? { blocks: reviewBlocks(thought).map((block) => ({ ...block })) } : {}),
+    ...(Array.isArray(thought.blocks) ? { blocks: thought.blocks.map((block) => ({ ...block })) } : {}),
   };
 }
 
@@ -1528,7 +2867,12 @@ async function persistThoughtSnapshot(rawSnapshot) {
         saved = result.thought;
         // 请求期间可能继续输入，不能用较早的服务端快照覆盖最新本地正文。
         const latest = thoughtDraft;
-        state.thoughtEntries.push(latest ? { ...saved, title: latest.title, text: latest.text, categoryId: latest.categoryId, ...(latest.blocks ? { blocks: latest.blocks } : {}) } : saved);
+        // 保留编辑对象身份，首次保存后正在上传的图片仍写入这一篇文章。
+        if (latest) {
+          const local = { title: latest.title, text: latest.text, categoryId: latest.categoryId, ...(latest.blocks ? { blocks: latest.blocks } : {}) };
+          Object.assign(latest, saved, local);
+        }
+        state.thoughtEntries.push(latest || saved);
         if (selectedThoughtId === 'draft') selectedThoughtId = saved.id;
         thoughtDraft = null;
         const card = $('.free-editor-card');
@@ -1548,7 +2892,7 @@ async function persistThoughtSnapshot(rawSnapshot) {
         const index = state.thoughtEntries.findIndex((entry) => entry.id === saved.id);
         if (index >= 0) {
           const latest = state.thoughtEntries[index];
-          state.thoughtEntries[index] = { ...saved, title: latest.title, text: latest.text, categoryId: latest.categoryId, ...(latest.blocks ? { blocks: latest.blocks } : {}) };
+          Object.assign(latest, { ...saved, title: latest.title, text: latest.text, categoryId: latest.categoryId, ...(latest.blocks ? { blocks: latest.blocks } : {}) });
         }
       }
       if (thinkRetry && thinkRetry.kind === rawSnapshot.kind && thinkRetry.date === rawSnapshot.date && thinkRetry.title === rawSnapshot.title && thinkRetry.text === rawSnapshot.text && thinkRetry.categoryId === rawSnapshot.categoryId && JSON.stringify(thinkRetry.blocks) === JSON.stringify(rawSnapshot.blocks)) {
@@ -1569,8 +2913,7 @@ async function persistThoughtSnapshot(rawSnapshot) {
 }
 
 async function flushThoughtSave() {
-  if (reviewUploadPromise && !(await reviewUploadPromise)) return false;
-  if (reviewUploadFailure) { toast('有图片尚未插入，请先重试或取消待插入图片。', true); return false; }
+  if (!await flushRichEditorUploads()) return false;
   clearTimeout(thinkTimer);
   thinkTimer = null;
   if (thoughtSavePromise) {
@@ -1631,19 +2974,21 @@ function scheduleReflectSave() {
 }
 
 function samePlanSnapshot(left, right) {
-  return left && right && left.id === right.id && left.name === right.name && left.description === right.description && left.note === right.note;
+  return left && right && left.id === right.id && left.name === right.name && left.description === right.description && left.note === right.note
+    && JSON.stringify(left.descriptionBlocks || []) === JSON.stringify(right.descriptionBlocks || [])
+    && JSON.stringify(left.noteBlocks || []) === JSON.stringify(right.noteBlocks || []);
 }
 
 async function persistPlanSnapshot(rawSnapshot) {
   if (!rawSnapshot) return true;
   if (planSavePromise) await planSavePromise;
-  const snapshot = { ...rawSnapshot };
+  const snapshot = { ...rawSnapshot, descriptionBlocks: cloneRichBlocks(rawSnapshot.descriptionBlocks), noteBlocks: cloneRichBlocks(rawSnapshot.noteBlocks) };
   planSavePromise = (async () => {
     try {
-      await Promise.all([
-        api('PATCH', `/api/plans/${snapshot.id}`, { name: snapshot.name, description: snapshot.description }),
-        api('POST', `/api/plans/${snapshot.id}/note`, { note: snapshot.note }),
-      ]);
+      await api('PATCH', `/api/plans/${snapshot.id}`, {
+        name: snapshot.name, description: snapshot.description, note: snapshot.note,
+        descriptionBlocks: snapshot.descriptionBlocks, noteBlocks: snapshot.noteBlocks,
+      });
       if (selectedPlanId === snapshot.id) setPlanStatus(samePlanSnapshot(planRetry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
       if (samePlanSnapshot(planRetry, snapshot)) planRetry = null;
       return true;
@@ -1662,9 +3007,8 @@ function schedulePlanSave() {
   const plan = currentPlan();
   if (!plan) return;
   plan.name = $('#planName').value.trim() || plan.name;
-  plan.description = $('#planDescription').value;
-  plan.note = $('#planNote').value;
-  const snapshot = { id: plan.id, name: plan.name, description: plan.description, note: plan.note };
+  const snapshot = { id: plan.id, name: plan.name, description: plan.description, note: plan.note,
+    descriptionBlocks: cloneRichBlocks(plan.descriptionBlocks), noteBlocks: cloneRichBlocks(plan.noteBlocks) };
   planRetry = snapshot;
   setPlanStatus('输入中…');
   clearTimeout(planTimer);
@@ -1676,19 +3020,21 @@ function schedulePlanSave() {
 }
 
 function sameTemplateSnapshot(left, right) {
-  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note;
+  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note
+    && JSON.stringify(left.contentBlocks || []) === JSON.stringify(right.contentBlocks || [])
+    && JSON.stringify(left.noteBlocks || []) === JSON.stringify(right.noteBlocks || []);
 }
 
 async function persistTemplateSnapshot(rawSnapshot) {
   if (!rawSnapshot) return true;
   if (templateSavePromise) await templateSavePromise;
-  const snapshot = { ...rawSnapshot };
+  const snapshot = { ...rawSnapshot, contentBlocks: cloneRichBlocks(rawSnapshot.contentBlocks), noteBlocks: cloneRichBlocks(rawSnapshot.noteBlocks) };
   templateSavePromise = (async () => {
     try {
-      await Promise.all([
-        api('PATCH', `/api/templates/${snapshot.id}`, { name: snapshot.name, content: snapshot.content }),
-        api('POST', `/api/templates/${snapshot.id}/note`, { note: snapshot.note }),
-      ]);
+      await api('PATCH', `/api/templates/${snapshot.id}`, {
+        name: snapshot.name, content: snapshot.content, note: snapshot.note,
+        contentBlocks: snapshot.contentBlocks, noteBlocks: snapshot.noteBlocks,
+      });
       if (selectedTemplateId === snapshot.id) setTemplateStatus(sameTemplateSnapshot(templateRetry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
       if (sameTemplateSnapshot(templateRetry, snapshot)) templateRetry = null;
       return true;
@@ -1707,9 +3053,8 @@ function scheduleTemplateSave() {
   const template = currentTemplate();
   if (!template) return;
   template.name = $('#templateName').value.trim() || template.name;
-  template.content = $('#templateContent').value;
-  template.note = $('#templateNote').value;
-  const snapshot = { id: template.id, name: template.name, content: template.content, note: template.note };
+  const snapshot = { id: template.id, name: template.name, content: template.content, note: template.note,
+    contentBlocks: cloneRichBlocks(template.contentBlocks), noteBlocks: cloneRichBlocks(template.noteBlocks) };
   templateRetry = snapshot;
   setTemplateStatus('输入中…');
   clearTimeout(templateTimer);
@@ -1721,16 +3066,21 @@ function scheduleTemplateSave() {
 }
 
 function sameProblemSnapshot(left, right) {
-  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note;
+  return left && right && left.id === right.id && left.name === right.name && left.content === right.content && left.note === right.note
+    && JSON.stringify(left.contentBlocks || []) === JSON.stringify(right.contentBlocks || [])
+    && JSON.stringify(left.noteBlocks || []) === JSON.stringify(right.noteBlocks || []);
 }
 
 async function persistProblemSnapshot(rawSnapshot) {
   if (!rawSnapshot) return true;
   if (problemSavePromise) await problemSavePromise;
-  const snapshot = { ...rawSnapshot };
+  const snapshot = { ...rawSnapshot, contentBlocks: cloneRichBlocks(rawSnapshot.contentBlocks), noteBlocks: cloneRichBlocks(rawSnapshot.noteBlocks) };
   problemSavePromise = (async () => {
     try {
-      await api('PATCH', `/api/problems/${snapshot.id}`, { name: snapshot.name, content: snapshot.content, note: snapshot.note });
+      await api('PATCH', `/api/problems/${snapshot.id}`, {
+        name: snapshot.name, content: snapshot.content, note: snapshot.note,
+        contentBlocks: snapshot.contentBlocks, noteBlocks: snapshot.noteBlocks,
+      });
       if (selectedProblemId === snapshot.id) setProblemStatus(sameProblemSnapshot(problemRetry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
       if (sameProblemSnapshot(problemRetry, snapshot)) problemRetry = null;
       return true;
@@ -1749,9 +3099,8 @@ function scheduleProblemSave() {
   const problem = currentProblem();
   if (!problem) return;
   problem.name = $('#problemName').value.trim() || problem.name;
-  problem.content = $('#problemContent').value;
-  problem.note = $('#problemNote').value;
-  const snapshot = { id: problem.id, name: problem.name, content: problem.content, note: problem.note };
+  const snapshot = { id: problem.id, name: problem.name, content: problem.content, note: problem.note,
+    contentBlocks: cloneRichBlocks(problem.contentBlocks), noteBlocks: cloneRichBlocks(problem.noteBlocks) };
   problemRetry = snapshot;
   setProblemStatus('输入中…');
   clearTimeout(problemTimer);
@@ -1762,7 +3111,93 @@ function scheduleProblemSave() {
   }, 650);
 }
 
+// 快照携带 moduleId + templateId：异步回调只更新请求发起时捕获的模块与模板，
+// 后台保存其他模块时不改当前编辑器的状态文字
+function sameLibrarySnapshot(left, right) {
+  return left && right && left.moduleId === right.moduleId && left.templateId === right.templateId
+    && left.name === right.name && left.content === right.content && left.note === right.note
+    && JSON.stringify(left.contentBlocks || []) === JSON.stringify(right.contentBlocks || [])
+    && JSON.stringify(left.noteBlocks || []) === JSON.stringify(right.noteBlocks || []);
+}
+
+async function persistLibrarySnapshot(rawSnapshot) {
+  if (dataReloadRequired) return false;
+  const mod = LIBRARY_MODULES[rawSnapshot.moduleId];
+  const rt = libraryState(rawSnapshot.moduleId);
+  if (!mod) return true;
+  if (rt.savePromise) {
+    try { await rt.savePromise; } catch (_) { /* 使用当前快照继续重试 */ }
+  }
+  const snapshot = { ...rawSnapshot, contentBlocks: cloneRichBlocks(rawSnapshot.contentBlocks), noteBlocks: cloneRichBlocks(rawSnapshot.noteBlocks) };
+  rt.savePromise = (async () => {
+    try {
+      const result = await api('PATCH', `${mod.apiTemplates}/${snapshot.templateId}`, {
+        name: snapshot.name, content: snapshot.content, note: snapshot.note,
+        contentBlocks: snapshot.contentBlocks, noteBlocks: snapshot.noteBlocks,
+      });
+      const local = libraryTemplates(snapshot.moduleId).find((entry) => entry.id === snapshot.templateId);
+      if (local && result.template?.updatedAt) {
+        local.updatedAt = result.template.updatedAt;
+        const label = $(`.plan-list-row[data-id="${snapshot.templateId}"] .learning-updated`);
+        if (label) label.textContent = learningUpdatedLabel(local.updatedAt);
+      }
+      if (currentView === snapshot.moduleId && rt.selectedId === snapshot.templateId) {
+        setLibraryStatus(snapshot.moduleId, sameLibrarySnapshot(rt.retry, snapshot) ? `已保存 ${nowTime()}` : '正在保存…');
+      }
+      if (sameLibrarySnapshot(rt.retry, snapshot)) rt.retry = null;
+      return true;
+    } catch (error) {
+      if (currentView === snapshot.moduleId && rt.selectedId === snapshot.templateId) {
+        setLibraryStatus(snapshot.moduleId, '保存失败，点击重试', true);
+      }
+      toast(error.message, true);
+      return false;
+    } finally {
+      rt.savePromise = null;
+    }
+  })();
+  return rt.savePromise;
+}
+
+function scheduleLibrarySave(moduleId) {
+  const mod = LIBRARY_MODULES[moduleId];
+  const rt = libraryState(moduleId);
+  if (dataRestoreLock || dataReloadRequired) return;
+  const template = libraryTemplates(moduleId).find((entry) => entry.id === rt.selectedId);
+  if (!template) return;
+  template.name = $(`#${mod.editor.name}`).value.trim() || template.name;
+  const snapshot = { moduleId, templateId: template.id, name: template.name, content: template.content, note: template.note,
+    contentBlocks: cloneRichBlocks(template.contentBlocks), noteBlocks: cloneRichBlocks(template.noteBlocks) };
+  rt.retry = snapshot;
+  setLibraryStatus(moduleId, '输入中…');
+  clearTimeout(rt.timer);
+  rt.timer = setTimeout(() => {
+    rt.timer = null;
+    if (rt.selectedId === snapshot.templateId) setLibraryStatus(moduleId, '正在保存…');
+    persistLibrarySnapshot(snapshot);
+  }, 650);
+}
+
+// 切换模板/分类/模块/界面前先提交当前输入；保存失败则保持原状态不切换
+async function flushLibrarySave(moduleId) {
+  const rt = libraryState(moduleId);
+  clearTimeout(rt.timer);
+  rt.timer = null;
+  if (rt.savePromise) {
+    try { await rt.savePromise; } catch (_) { /* retry snapshot remains */ }
+  }
+  clearTimeout(rt.timer);
+  rt.timer = null;
+  const snapshot = rt.retry;
+  if (!snapshot) return true;
+  return persistLibrarySnapshot(snapshot);
+}
+
 async function flushPendingSaves() {
+  if (!await LifeDrawings.flush()) return false;
+  if (dataReloadRequired) return false;
+  const richUploadsSaved = await flushRichEditorUploads();
+  if (!richUploadsSaved) return false;
   const thoughtSaved = await flushThoughtSave();
   const reflectSnapshot = reflectRetry;
   clearTimeout(reflectTimer);
@@ -1780,7 +3215,24 @@ async function flushPendingSaves() {
   clearTimeout(problemTimer);
   problemTimer = null;
   const problemSaved = problemSnapshot ? await persistProblemSnapshot(problemSnapshot) : !problemSavePromise || await problemSavePromise;
-  return thoughtSaved && reflectSaved && planSaved && templateSaved && problemSaved;
+  let librariesSaved = true;
+  for (const moduleId of Object.keys(LIBRARY_MODULES)) {
+    if (!await flushLibrarySave(moduleId)) librariesSaved = false;
+  }
+  return thoughtSaved && reflectSaved && planSaved && templateSaved && problemSaved && librariesSaved && richUploadsSaved;
+}
+
+function hasPendingLibrarySaves() {
+  return Object.values(libraryRuntime).some((rt) => rt.timer || rt.savePromise || rt.retry);
+}
+
+// 恢复备份/重载前丢弃所有待保存内容，避免旧保存请求在恢复完成后覆盖恢复结果
+function discardPendingLibrarySaves() {
+  for (const rt of Object.values(libraryRuntime)) {
+    clearTimeout(rt.timer);
+    rt.timer = null;
+    rt.retry = null;
+  }
 }
 
 function bindManageInputs() {
@@ -1792,7 +3244,7 @@ function bindManageInputs() {
   }));
 }
 
-function openFormModal({ eyebrow = '编辑', title, label, value = '', placeholder = '', submitText = '保存', multiline = false, onSubmit }) {
+function openFormModal({ eyebrow = '编辑', title, label, value = '', placeholder = '', submitText = '保存', multiline = false, allowEmpty = false, onSubmit }) {
   $('#modalEyebrow').textContent = eyebrow;
   $('#modalTitle').textContent = title;
   $('#modalBody').innerHTML = multiline
@@ -1804,7 +3256,7 @@ function openFormModal({ eyebrow = '编辑', title, label, value = '', placehold
   setTimeout(() => { $('#modalInput').focus(); $('#modalInput').select(); }, 0);
   const submit = async () => {
     const clean = $('#modalInput').value.trim();
-    if (!clean) { toast(`${label}不能为空`, true); return; }
+    if (!clean && !allowEmpty) { toast(`${label}不能为空`, true); return; }
     $('#modalSubmit').disabled = true;
     try { await onSubmit(clean); closeModal(); } catch (error) { toast(error.message, true); $('#modalSubmit').disabled = false; }
   };
@@ -1854,7 +3306,16 @@ function openConfirmModal({ title, message, confirmText = '确认删除', onConf
   $('[data-modal-cancel]').onclick = closeModal;
 }
 
-function closeModal() { $('#modalBackdrop').classList.add('hidden'); }
+function closeModal(force = false) {
+  const customOpen = $('#modalBackdrop').dataset.customModule === 'true';
+  if (customOpen && force !== true && customCreationPromise) return;
+  $('#modalBackdrop').classList.add('hidden');
+  delete $('#modalBackdrop').dataset.customModule;
+  $('.modal').classList.remove('custom-module-modal');
+  $('.modal').onkeydown = null;
+  $('#modalClose').disabled = false;
+  if (customOpen) $('#addCustomModule')?.focus();
+}
 
 function openAddThoughtCategoryModal() {
   const kind = thoughtKind(currentThought() || { kind: thoughtMode });
@@ -1920,7 +3381,109 @@ async function addItem(sectionId, rawValue) {
 
 async function handleAction(button) {
   const action = button.dataset.action;
+  if (action.startsWith('rich-')) { await handleRichAction(button); return; }
   if (action.startsWith('review-')) { await handleReviewImageAction(button); return; }
+  if (action.startsWith('library-')) { await handleLibraryAction(button); return; }
+  if (action.startsWith('flat-')) { await handleFlatAction(button); return; }
+
+  // ---------- 界面导航与设置 ----------
+  if (action === 'switch-workspace') {
+    await handleSwitchWorkspace();
+    return;
+  }
+  if (action === 'open-settings') {
+    await changeView('settings');
+    return;
+  }
+  if (action === 'open-principle-manage') {
+    currentPrincipleTab = 'manage';
+    await changeView('principles', 'manage');
+    return;
+  }
+  if (action === 'custom-module-open') { await openCustomModuleModal(); return; }
+  if (action.startsWith('settings-') && (customCreationPromise || settingsSaving || dataRestoreLock)) return;
+  if (action === 'settings-placement') {
+    settingsDraft.placementByModule[button.dataset.moduleId] = button.dataset.placement === 'zone' ? 'zone' : 'main';
+    markSettingsDirty();
+    return;
+  }
+  if (action === 'settings-move') {
+    const index = settingsDraft.moduleOrder.indexOf(button.dataset.moduleId);
+    moveModuleInDraft(button.dataset.moduleId, button.dataset.dir === 'up' ? index - 1 : index + 1);
+    return;
+  }
+  if (action === 'settings-save') {
+    await saveSettings();
+    return;
+  }
+  if (action === 'settings-cancel') {
+    await cancelSettings();
+    return;
+  }
+  if (action === 'settings-delete-module') {
+    const module = moduleById(button.dataset.moduleId);
+    if (!module) return;
+    openConfirmModal({
+      title: `删除模块「${module.name}」？`,
+      message: `这个模块和里面的内容会离开正在使用的数据。${TRASH_HINT}`,
+      confirmText: '移入垃圾站',
+      onConfirm: async () => {
+        if (!(await flushPendingSaves())) throw new Error('有内容尚未保存成功，请先重试保存');
+        await api('DELETE', `/api/modules/${module.id}`);
+        await reloadLiveState();
+        render();
+        toast(`已将「${module.name}」移入垃圾站`);
+      },
+    });
+    return;
+  }
+  if (action === 'trash-restore') {
+    const entry = trashEntries.find((item) => item.id === button.dataset.id);
+    if (!entry) return;
+    openConfirmModal({
+      title: `恢复「${entry.title || '这条内容'}」？`,
+      message: '恢复后会回到原来的位置，并重新进入正在使用的数据。',
+      confirmText: '恢复',
+      onConfirm: async () => {
+        await api('POST', `/api/trash/${entry.id}/restore`);
+        await reloadLiveState();
+        render();
+        toast('已从垃圾站恢复');
+      },
+    });
+    return;
+  }
+  if (action === 'trash-purge') {
+    const entry = trashEntries.find((item) => item.id === button.dataset.id);
+    if (!entry) return;
+    openConfirmModal({
+      title: `彻底删除「${entry.title || '这条内容'}」？`,
+      message: '彻底删除后无法恢复，占用的文件也会从这台电脑消失。',
+      confirmText: '彻底删除',
+      onConfirm: async () => {
+        await api('DELETE', `/api/trash/${entry.id}`);
+        trashEntries = trashEntries.filter((item) => item.id !== entry.id);
+        render();
+        toast('已彻底删除');
+      },
+    });
+    return;
+  }
+  if (action === 'trash-empty') {
+    if (!trashEntries.length) return;
+    openConfirmModal({
+      title: '清空垃圾站？',
+      message: '垃圾站里的模块、内容和文件都会彻底删除，无法恢复。',
+      confirmText: '清空',
+      onConfirm: async () => {
+        await api('POST', '/api/trash/empty');
+        trashEntries = [];
+        render();
+        toast('垃圾站已清空');
+      },
+    });
+    return;
+  }
   if (action === 'prev-date' || action === 'next-date' || action === 'today-date') {
     if (currentView === 'thoughts' && isArticleMode() && !(await flushThoughtSave())) return;
     selectedDate = action === 'today-date' ? localToday() : addDays(selectedDate, action === 'prev-date' ? -1 : 1);
@@ -1933,8 +3496,12 @@ async function handleAction(button) {
   }
   if (action === 'principle-tab') { currentPrincipleTab = button.dataset.tab; render(); return; }
   if (action === 'create-backup') {
+    if (customCreationPromise) await customCreationPromise;
+    if (customCreation?.phase === 'unknown') { toast('请先确认创建结果', true); return; }
     button.disabled = true;
     try {
+      // 备份必须包含用户最后一次输入
+      if (!(await flushPendingSaves())) { toast('有内容尚未保存成功，请先重试保存', true); return; }
       const result = await api('POST', '/api/backups');
       state.backups.unshift(result.backup);
       render();
@@ -1943,15 +3510,26 @@ async function handleAction(button) {
     return;
   }
   if (action === 'restore-backup') {
+    if (customCreationPromise) await customCreationPromise;
+    if (customCreation?.phase === 'unknown') { toast('请先确认创建结果', true); return; }
     const backup = state.backups.find((entry) => entry.id === button.dataset.id);
     if (!backup) return;
     openConfirmModal({
       title: '恢复这份备份？',
-      message: '当前数据会先自动备份，然后恢复所选备份中的记录和复盘图片。恢复后页面将刷新。',
+      message: '当前数据会先自动备份，然后恢复所选备份中的记录、图片、图稿及素材库。恢复后页面将刷新。',
       confirmText: '恢复备份',
       onConfirm: async () => {
-        await api('POST', `/api/backups/${backup.id}/restore`);
-        location.reload();
+        // 恢复前等待全部保存成功，恢复期间锁定编辑，避免旧保存请求覆盖恢复结果
+        if (!(await flushPendingSaves())) throw new Error('有内容尚未保存成功，请先重试保存后再恢复');
+        dataRestoreLock = true;
+        discardPendingLibrarySaves();
+        try {
+          await api('POST', `/api/backups/${backup.id}/restore`);
+          location.reload();
+        } catch (error) {
+          dataRestoreLock = false;
+          throw error;
+        }
       },
     });
     return;
@@ -2139,7 +3717,7 @@ async function handleAction(button) {
     if (!(await flushThoughtSave())) return;
     const thought = currentThought();
     if (!thought || thought.id === 'draft') return;
-    openConfirmModal({ title: `删除「${effectiveThoughtTitle(thought)}」？`, message: `这篇${thoughtKindLabel(thoughtKind(thought))}会被永久删除，此操作无法撤销。`, confirmText: `删除${thoughtNoun(thought)}`, onConfirm: async () => {
+    openConfirmModal({ title: `删除「${effectiveThoughtTitle(thought)}」？`, message: `这篇${thoughtKindLabel(thoughtKind(thought))}会移入垃圾站。${TRASH_HINT}`, confirmText: `删除${thoughtNoun(thought)}`, onConfirm: async () => {
       clearTimeout(thinkTimer); thinkTimer = null; thinkRetry = null;
       await api('DELETE', `/api/thoughts/${thought.id}`);
       state.thoughtEntries = state.thoughtEntries.filter((entry) => entry.id !== thought.id);
@@ -2167,7 +3745,7 @@ async function handleAction(button) {
   if (action === 'delete-history-thought') {
     const thought = state.thoughtEntries.find((entry) => entry.id === button.dataset.id);
     if (!thought) return;
-    openConfirmModal({ title: `删除「${effectiveThoughtTitle(thought)}」？`, message: `${dateLabel(thought.date)}的这篇${thoughtKindLabel(thoughtKind(thought))}会被永久删除。`, confirmText: `删除${thoughtNoun(thought)}`, onConfirm: async () => {
+    openConfirmModal({ title: `删除「${effectiveThoughtTitle(thought)}」？`, message: `${dateLabel(thought.date)}的这篇${thoughtKindLabel(thoughtKind(thought))}会移入垃圾站。${TRASH_HINT}`, confirmText: `删除${thoughtNoun(thought)}`, onConfirm: async () => {
       await api('DELETE', `/api/thoughts/${thought.id}`);
       state.thoughtEntries = state.thoughtEntries.filter((entry) => entry.id !== thought.id);
       selectedHistoryKey = null;
@@ -2178,9 +3756,9 @@ async function handleAction(button) {
   }
   if (action === 'delete-history-reflection') {
     const date = button.dataset.date;
-    openConfirmModal({ title: `删除 ${dateLabel(date)} 的每日反思？`, message: '当天的反思回答会被清空，自由思考和每日复盘不会受到影响。', confirmText: '删除反思', onConfirm: async () => {
+    openConfirmModal({ title: `删除 ${dateLabel(date)} 的每日反思？`, message: `当天的反思回答会移入垃圾站。${TRASH_HINT}`, confirmText: '删除反思', onConfirm: async () => {
       clearTimeout(reflectTimer); reflectTimer = null; reflectRetry = null;
-      await api('POST', '/api/reflect', { date, entries: {} });
+      await api('DELETE', `/api/reflect/${date}`);
       delete state.reflectEntries[date];
       selectedHistoryKey = null;
       render();
@@ -2315,7 +3893,10 @@ async function handleAction(button) {
   // ---------- 问题拆解 ----------
   if (action === 'add-problem') {
     openFormModal({ eyebrow: '问题拆解', title: '新建问题', label: '问题标题', placeholder: '例如：学习效率低、总是拖延', submitText: '建立问题', onSubmit: async (name) => {
-      const result = await api('POST', '/api/problems', { name });
+      if (!(await flushPendingSaves())) throw new Error('当前内容尚未保存成功，请重试');
+      const filter = flatState('problems').categoryFilter;
+      const categoryId = filter !== 'all' && filter !== 'none' ? filter : null;
+      const result = await api('POST', '/api/problems', { name, categoryId });
       state.problems.push(result.problem);
       selectedProblemId = result.problem.id;
       problemMenuOpenId = null;
@@ -2344,11 +3925,11 @@ async function handleAction(button) {
   }
   if (action === 'move-problem') {
     problemMenuOpenId = null;
-    await moveEntity(state.problems, button.dataset.id, button.dataset.dir, '/api/problems/reorder', 'problems', (items) => { state.problems = items; }); return;
+    await flatMoveOrder('problems', button.dataset.id, button.dataset.dir); return;
   }
   if (action === 'delete-problem') {
     const problem = state.problems.find((item) => item.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${problem.name}」？`, message: '问题拆解内容和备注也会一并删除，这个操作无法撤销。', onConfirm: async () => {
+    openConfirmModal({ title: `删除「${problem.name}」？`, message: `问题拆解内容和备注会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
       if (selectedProblemId === problem.id && !(await flushPendingSaves())) throw new Error('问题尚未保存成功，请重试后再删除');
       const index = state.problems.findIndex((item) => item.id === problem.id);
       await api('DELETE', `/api/problems/${problem.id}`);
@@ -2361,6 +3942,24 @@ async function handleAction(button) {
     } });
     return;
   }
+
+  // ---------- 分类模板库（学习专区沿用旧操作名，逻辑走通用实现） ----------
+  if (action === 'add-learning') return libraryAddTemplate('learning');
+  if (action === 'select-learning') return librarySelectTemplate('learning', button.dataset.id);
+  if (action === 'open-learning-menu') return libraryToggleMenu('learning', button.dataset.id);
+  if (action === 'retry-learning-save') return libraryRetrySave('learning');
+  if (action === 'move-learning') return libraryMoveTemplate('learning', button.dataset.id, button.dataset.dir);
+  if (action === 'delete-learning') return libraryDeleteTemplate('learning', button.dataset.id);
+  if (action === 'toggle-learning-filter') return libraryToggleFilterMenu('learning');
+  if (action === 'set-learning-filter') return librarySetFilter('learning', button.dataset.filter);
+  if (action === 'add-learning-category') return libraryAddCategory('learning');
+  if (action === 'open-learning-category-manager') {
+    render();
+    openLibraryCategoryManager('learning');
+    return;
+  }
+  if (action === 'rename-learning-category') return libraryRenameCategory('learning', button.dataset.id);
+  if (action === 'delete-learning-category') return libraryDeleteCategory('learning', button.dataset.id);
 
   if (action === 'add-section') {
     openFormModal({ eyebrow: '原则管理', title: '新建原则', label: '原则名称', placeholder: '例如：专注重要，少即是多', submitText: '建立原则', onSubmit: async (name) => {
@@ -2377,8 +3976,9 @@ async function handleAction(button) {
   }
   if (action === 'delete-section') {
     const section = state.sections.find((item) => item.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${section.name}」？`, message: '该原则下的条目和历史打卡记录也会一并删除，这个操作无法撤销。', onConfirm: async () => {
-      await api('DELETE', `/api/sections/${section.id}`); state.sections = state.sections.filter((item) => item.id !== section.id); render();
+    openConfirmModal({ title: `删除「${section.name}」？`, message: `该原则下的条目和历史打卡记录也会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
+      const ids = (section.items || []).flatMap((item) => [item.id, ...(item.children || []).map((child) => child.id)]);
+      await api('DELETE', `/api/sections/${section.id}`); state.sections = state.sections.filter((item) => item.id !== section.id); forgetCheckinIds(ids); render();
     } });
     return;
   }
@@ -2409,8 +4009,9 @@ async function handleAction(button) {
   if (action === 'delete-item') {
     const section = state.sections.find((item) => item.id === button.dataset.section);
     const item = section.items.find((entry) => entry.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${item.name}」？`, message: '这个条目、其子节点及所有相关的历史打卡和未完成原因都会被删除。', onConfirm: async () => {
-      await api('DELETE', `/api/sections/${section.id}/items/${item.id}`); section.items = section.items.filter((entry) => entry.id !== item.id); render();
+    openConfirmModal({ title: `删除「${item.name}」？`, message: `这个条目、其子节点及相关打卡记录会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
+      const ids = [item.id, ...(item.children || []).map((child) => child.id)];
+      await api('DELETE', `/api/sections/${section.id}/items/${item.id}`); section.items = section.items.filter((entry) => entry.id !== item.id); forgetCheckinIds(ids); render();
     } });
     return;
   }
@@ -2435,9 +4036,10 @@ async function handleAction(button) {
     const item = section?.items.find((entry) => entry.id === button.dataset.item);
     const child = item?.children?.find((entry) => entry.id === button.dataset.id);
     if (!child) return;
-    openConfirmModal({ title: `删除「${child.name}」？`, message: '这个子节点的历史打卡和未完成原因也会被删除。', onConfirm: async () => {
+    openConfirmModal({ title: `删除「${child.name}」？`, message: `这个子节点和它的打卡记录会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
       await api('DELETE', `/api/sections/${section.id}/items/${item.id}/children/${child.id}`);
       item.children = item.children.filter((entry) => entry.id !== child.id);
+      forgetCheckinIds([child.id]);
       render();
     } });
     return;
@@ -2465,15 +4067,25 @@ async function handleAction(button) {
   }
   if (action === 'delete-framework') {
     const framework = state.reflectFrameworks.find((item) => item.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${framework.name}」？`, message: '历史反思中这个问题对应的内容也会被删除。', onConfirm: async () => {
-      await api('DELETE', `/api/reflect/frameworks/${framework.id}`); state.reflectFrameworks = state.reflectFrameworks.filter((item) => item.id !== framework.id); render();
+    openConfirmModal({ title: `删除「${framework.name}」？`, message: `这个问题和历史回答会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
+      await api('DELETE', `/api/reflect/frameworks/${framework.id}`);
+      state.reflectFrameworks = state.reflectFrameworks.filter((item) => item.id !== framework.id);
+      for (const date of Object.keys(state.reflectEntries)) {
+        if (!state.reflectEntries[date]) continue;
+        delete state.reflectEntries[date][framework.id];
+        if (!Object.keys(state.reflectEntries[date]).length) delete state.reflectEntries[date];
+      }
+      render();
     } });
     return;
   }
 
   if (action === 'add-plan') {
     openFormModal({ eyebrow: '计划', title: '新建计划', label: '计划名称', placeholder: '例如：完成个人作品集', submitText: '建立计划', onSubmit: async (name) => {
-      const result = await api('POST', '/api/plans', { name });
+      if (!(await flushPendingSaves())) throw new Error('当前内容尚未保存成功，请重试');
+      const filter = flatState('plans').categoryFilter;
+      const categoryId = filter !== 'all' && filter !== 'none' ? filter : null;
+      const result = await api('POST', '/api/plans', { name, categoryId });
       state.plans.push(result.plan);
       selectedPlanId = result.plan.id;
       planMenuOpenId = null;
@@ -2484,11 +4096,11 @@ async function handleAction(button) {
   }
   if (action === 'move-plan') {
     planMenuOpenId = null;
-    await moveEntity(state.plans, button.dataset.id, button.dataset.dir, '/api/plans/reorder', 'plans', (items) => { state.plans = items; }); return;
+    await flatMoveOrder('plans', button.dataset.id, button.dataset.dir); return;
   }
   if (action === 'delete-plan') {
     const plan = state.plans.find((item) => item.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${plan.name}」？`, message: '计划描述和笔记也会一并删除，这个操作无法撤销。', onConfirm: async () => {
+    openConfirmModal({ title: `删除「${plan.name}」？`, message: `计划描述和笔记会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
       if (selectedPlanId === plan.id && !(await flushPendingSaves())) throw new Error('计划尚未保存成功，请重试后再删除');
       const index = state.plans.findIndex((item) => item.id === plan.id);
       await api('DELETE', `/api/plans/${plan.id}`);
@@ -2505,7 +4117,10 @@ async function handleAction(button) {
   // ---------- 个人模板 ----------
   if (action === 'add-template') {
     openFormModal({ eyebrow: '个人模板', title: '新建模板', label: '模板名称', placeholder: '例如：周报框架、复盘提纲、活动清单', submitText: '建立模板', onSubmit: async (name) => {
-      const result = await api('POST', '/api/templates', { name });
+      if (!(await flushPendingSaves())) throw new Error('当前内容尚未保存成功，请重试');
+      const filter = flatState('templates').categoryFilter;
+      const categoryId = filter !== 'all' && filter !== 'none' ? filter : null;
+      const result = await api('POST', '/api/templates', { name, categoryId });
       state.templates.push(result.template);
       selectedTemplateId = result.template.id;
       templateMenuOpenId = null;
@@ -2517,11 +4132,11 @@ async function handleAction(button) {
   if (action === 'select-template') { selectedTemplateId = button.dataset.id; templateMenuOpenId = null; render(); return; }
   if (action === 'move-template') {
     templateMenuOpenId = null;
-    await moveEntity(state.templates, button.dataset.id, button.dataset.dir, '/api/templates/reorder', 'templates', (items) => { state.templates = items; }); return;
+    await flatMoveOrder('templates', button.dataset.id, button.dataset.dir); return;
   }
   if (action === 'delete-template') {
     const template = state.templates.find((item) => item.id === button.dataset.id);
-    openConfirmModal({ title: `删除「${template.name}」？`, message: '模板内容和备注也会一并删除，这个操作无法撤销。', onConfirm: async () => {
+    openConfirmModal({ title: `删除「${template.name}」？`, message: `模板内容和备注会移入垃圾站。${TRASH_HINT}`, onConfirm: async () => {
       if (selectedTemplateId === template.id && !(await flushPendingSaves())) throw new Error('模板尚未保存成功，请重试后再删除');
       const index = state.templates.findIndex((item) => item.id === template.id);
       await api('DELETE', `/api/templates/${template.id}`);
@@ -2860,29 +4475,109 @@ async function toggleRecurring(eventId) {
   } catch (error) { toast(error.message, true); }
 }
 
-async function changeView(view, openTab) {
-  if (currentView === 'thoughts' && thoughtSurface === 'editor' && isArticleMode() && !(await flushThoughtSave())) return;
-  if (thoughtDraft && !hasThoughtContent(thoughtDraft)) thoughtDraft = null;
-  currentView = view;
-  if (view === 'thoughts') {
-    thoughtSurface = 'history';
-    selectedHistoryKey = null;
-    thoughtHistoryFilter = 'free';
-    thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' };
-    thoughtHistoryQuery = '';
-    historyListScroll = { app: 0, window: 0 };
-  }
-  if (openTab) currentPrincipleTab = openTab;
+function resetThoughtsSurface() {
+  thoughtSurface = 'history';
+  selectedHistoryKey = null;
+  thoughtHistoryFilter = 'free';
+  thoughtHistoryCategory = { free: 'all', review: 'all', extraction: 'all' };
+  thoughtHistoryQuery = '';
+  historyListScroll = { app: 0, window: 0 };
+}
+
+function resetViewMenus() {
   planMenuOpenId = null;
   templateMenuOpenId = null;
   problemMenuOpenId = null;
+  for (const rt of Object.values(libraryRuntime)) {
+    rt.menuOpenId = null;
+    rt.filterMenuOpen = false;
+  }
   eventMenuKey = null;
+}
+
+// 进入指定界面的指定视图（preferredView 为空时取该界面上次访问或第一项，空界面为 null）
+async function enterWorkspaceView(workspace, preferredView) {
+  LifeDrawings.leaveForNavigation();
+  if (customCreationPromise) await customCreationPromise;
+  if (settingsSaving) await settingsSaving;
+  if (thoughtDraft && !hasThoughtContent(thoughtDraft)) thoughtDraft = null;
+  currentWorkspace = workspace;
+  currentView = resolveWorkspaceView(workspace, preferredView ?? null);
+  if (currentView === 'thoughts') resetThoughtsSurface();
+  resetViewMenus();
+  recordNavigationContext(workspace, currentView);
   render();
-  if (view === 'thoughts') {
+  if (currentView === 'thoughts') {
     $('#app').scrollTop = 0;
     window.scrollTo(0, 0);
   }
   $('#app').focus({ preventScroll: true });
+}
+
+async function changeView(view, openTab) {
+  if (customCreationPromise) await customCreationPromise;
+  if (settingsSaving) await settingsSaving;
+  if (view === 'drawingManager') {
+    if (currentView === 'settings' && settingsDirty) { openLeaveSettingsModal(() => changeView(view)); return; }
+    if (!(await flushPendingSaves())) return;
+    LifeDrawings.leaveForNavigation();
+    currentView = 'drawingManager'; resetViewMenus();
+    await DrawingManagerUI.load(); render(); $('#app').focus({ preventScroll: true }); return;
+  }
+  // 设置页本身：进入时从已保存配置复制草稿；已在设置页时再次点击不重置草稿
+  if (view === 'settings') {
+    if (currentView === 'settings') {
+      if (LifeDrawings.active && await flushPendingSaves()) LifeDrawings.leaveForNavigation();
+      return;
+    }
+    if (!(await flushPendingSaves())) return;
+    LifeDrawings.leaveForNavigation();
+    settingsReturn = { workspace: currentWorkspace, view: isModuleView(currentView) || currentView === null ? currentView : null };
+    currentView = 'settings';
+    initSettingsDraft();
+    resetViewMenus();
+    try { trashEntries = (await api('GET', '/api/trash')).entries || []; } catch (error) { toast(error.message, true); }
+    render();
+    $('#app').focus({ preventScroll: true });
+    return;
+  }
+  if (!isModuleView(view)) return;
+  // 通用模块跳转：设置/其他入口跳某模块时，先找到该模块当前归属再进入
+  const workspace = placementOfModule(view);
+  if (currentView === 'settings' && settingsDirty) {
+    openLeaveSettingsModal(() => changeView(view, openTab));
+    return;
+  }
+  if (currentView === 'thoughts' && thoughtSurface === 'editor' && isArticleMode() && !(await flushThoughtSave())) return;
+  if (!(await flushPendingSaves())) return;
+  if (openTab) currentPrincipleTab = openTab;
+  // 再次点击当前模块导航保持旧行为：重置该模块的界面状态并重绘
+  await enterWorkspaceView(workspace, view);
+}
+
+async function handleSwitchWorkspace() {
+  if (customCreationPromise) await customCreationPromise;
+  if (settingsSaving) await settingsSaving;
+  if (currentView === 'settings' && settingsDirty) {
+    openLeaveSettingsModal(() => handleSwitchWorkspace());
+    return;
+  }
+  if (currentView === 'thoughts' && thoughtSurface === 'editor' && isArticleMode() && !(await flushThoughtSave())) return;
+  if (!(await flushPendingSaves())) return;
+  // 切换后优先打开目标界面上次访问且仍归属它的模块，否则第一项
+  const target = currentWorkspace === 'main' ? 'zone' : 'main';
+  const last = navigationPreferences?.lastViewByWorkspace?.[target];
+  await enterWorkspaceView(target, last ?? null);
+}
+
+// 取消：恢复已保存草稿并返回进入设置前的有效模块；没有模块则回到该界面空状态
+async function cancelSettings() {
+  if (customCreationPromise) await customCreationPromise;
+  if (settingsSaving) await settingsSaving;
+  initSettingsDraft();
+  const target = settingsReturn || { workspace: currentWorkspace, view: null };
+  if (!(await flushPendingSaves())) return;
+  await enterWorkspaceView(target.workspace, target.view ?? null);
 }
 
 function bindGlobalEvents() {
@@ -2892,7 +4587,9 @@ function bindGlobalEvents() {
       closeEventDrawer();
       return;
     }
-    if (planMenuOpenId || templateMenuOpenId || problemMenuOpenId || eventMenuKey) {
+    const openLibraryMenus = Object.values(libraryRuntime).some((rt) => rt.menuOpenId || rt.filterMenuOpen || rt.moveMenuOpenId);
+    const openFlatMenus = Object.values(flatCollectionRuntime).some((rt) => rt.moveMenuOpenId || rt.filterMenuOpen);
+    if (planMenuOpenId || templateMenuOpenId || problemMenuOpenId || openLibraryMenus || openFlatMenus || eventMenuKey) {
       const onPlanMenu = event.target.closest('[data-plan-menu]') || event.target.closest('[data-action="open-plan-menu"]');
       const onTemplateMenu = event.target.closest('[data-template-menu]') || event.target.closest('[data-action="open-template-menu"]');
       const onProblemMenu = event.target.closest('[data-problem-menu]') || event.target.closest('[data-action="open-problem-menu"]');
@@ -2901,8 +4598,30 @@ function bindGlobalEvents() {
       if (planMenuOpenId && !onPlanMenu) { planMenuOpenId = null; dirty = true; }
       if (templateMenuOpenId && !onTemplateMenu) { templateMenuOpenId = null; dirty = true; }
       if (problemMenuOpenId && !onProblemMenu) { problemMenuOpenId = null; dirty = true; }
+      for (const collection of Object.keys(flatCollectionRuntime)) {
+        const rt = flatState(collection);
+        if (!rt.moveMenuOpenId && !rt.filterMenuOpen) continue;
+        const inFlat = event.target.closest(`[data-flat-filter-menu="${collection}"]`)
+          || event.target.closest(`[data-flat-move-menu="${collection}"]`)
+          || event.target.closest(`[data-action="${flatAction(collection, 'toggle-filter')}"]`)
+          || event.target.closest(`[data-action="${flatAction(collection, 'open-move-menu')}"]`)
+          || event.target.closest(`[data-action="${flatAction(collection, 'add-category')}"]`)
+          || event.target.closest(`[data-action="${flatAction(collection, 'open-category-manager')}"]`);
+        if (rt.moveMenuOpenId && !inFlat) { rt.moveMenuOpenId = null; dirty = true; }
+        if (rt.filterMenuOpen && !inFlat) { rt.filterMenuOpen = false; dirty = true; }
+      }
+      for (const [moduleId, rt] of Object.entries(libraryRuntime)) {
+        if (!rt.menuOpenId && !rt.filterMenuOpen) continue;
+        const menuAction = libraryActionName(moduleId, 'menu');
+        const filterAction = libraryActionName(moduleId, 'toggle-filter');
+        const inMenu = event.target.closest('[data-library-menu]') || event.target.closest('[data-library-move-menu]') || event.target.closest('[data-action="library-open-move-menu"]') || event.target.closest(`[data-action="${menuAction}"]`);
+        const inFilter = event.target.closest('[data-library-filter-menu]') || event.target.closest(`[data-action="${filterAction}"]`);
+        if (rt.menuOpenId && !inMenu) { rt.menuOpenId = null; dirty = true; }
+        if (rt.moveMenuOpenId && !inMenu) { rt.moveMenuOpenId = null; dirty = true; }
+        if (rt.filterMenuOpen && !inFilter) { rt.filterMenuOpen = false; dirty = true; }
+      }
       if (eventMenuKey && !onEventMenu) { eventMenuKey = null; dirty = true; }
-      if (dirty && (currentView === 'plans' || currentView === 'templates' || currentView === 'problems' || currentView === 'events')) render();
+      if (dirty && (currentView === 'plans' || currentView === 'templates' || currentView === 'problems' || LIBRARY_MODULES[currentView] || currentView === 'events')) render();
     }
     const nav = event.target.closest('[data-view]');
     if (nav) { await changeView(nav.dataset.view, nav.dataset.openTab); return; }
@@ -2938,6 +4657,7 @@ function bindGlobalEvents() {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       if ($('#reviewImageViewer').open) { $('#reviewImageViewer').close(); return; }
+      if ($('#richImageViewer')?.open) { $('#richImageViewer').close(); return; }
       const drawer = $('#eventDrawerRoot');
       if (drawer && !drawer.classList.contains('hidden')) { closeEventDrawer(); return; }
       if (!$('#modalBackdrop').classList.contains('hidden')) { closeModal(); return; }
@@ -2961,12 +4681,78 @@ function bindGlobalEvents() {
   document.addEventListener('visibilitychange', saveWhenHidden);
   window.addEventListener('pagehide', () => { void flushPendingSaves(); });
   window.addEventListener('beforeunload', (event) => {
-    if (thinkTimer || thoughtSavePromise || thinkRetry || reviewUploadPromise || reviewUploadFailure || reflectTimer || reflectSavePromise || reflectRetry || planTimer || planSavePromise || planRetry || templateTimer || templateSavePromise || templateRetry || problemTimer || problemSavePromise || problemRetry) {
-      void flushPendingSaves();
+    if (customCreationPromise || thinkTimer || thoughtSavePromise || thinkRetry || reflectTimer || reflectSavePromise || reflectRetry || planTimer || planSavePromise || planRetry || templateTimer || templateSavePromise || templateRetry || problemTimer || problemSavePromise || problemRetry || hasPendingLibrarySaves() || hasPendingRichEditorUploads() || LifeDrawings.dirty) {
+      if (!dataRestoreLock) void flushPendingSaves();
       event.preventDefault();
       event.returnValue = '';
     }
   });
+}
+
+async function reloadLiveState() {
+  const [result, backupResult, trashResult] = await Promise.all([
+    api('GET', '/api/state'),
+    api('GET', '/api/backups'),
+    api('GET', '/api/trash'),
+  ]);
+  const draft = settingsDraft ? { moduleOrder: [...settingsDraft.moduleOrder], placementByModule: { ...settingsDraft.placementByModule } } : null;
+  const dirty = settingsDirty;
+  trashedModuleIds = result.trashedModuleIds || [];
+  trashEntries = trashResult.entries || [];
+  state = {
+    version: result.version || 0,
+    customModules: result.customModules || [],
+    sections: result.sections || [],
+    records: result.records || {},
+    checkinReasons: result.checkinReasons || {},
+    thoughtEntries: normalizeLoadedThoughts(result),
+    thoughtCategories: result.thoughtCategories || [],
+    reflectFrameworks: result.reflectFrameworks || [],
+    reflectEntries: result.reflectEntries || {},
+    plans: result.plans || [],
+    templates: result.templates || [],
+    problems: result.problems || [],
+    planCategories: result.planCategories || [],
+    templateCategories: result.templateCategories || [],
+    problemCategories: result.problemCategories || [],
+    learningCategories: result.learningCategories || [],
+    learningTemplates: result.learningTemplates || [],
+    coreThoughtCategories: result.coreThoughtCategories || [],
+    coreThoughtTemplates: result.coreThoughtTemplates || [],
+    reviewTemplateCategories: result.reviewTemplateCategories || [],
+    reviewTemplates: result.reviewTemplates || [],
+    events: result.events || [],
+    eventCheckins: result.eventCheckins || {},
+    eventExceptions: result.eventExceptions || [],
+    backups: backupResult.backups || [],
+  };
+  dataEpoch = result.dataEpoch;
+  installCustomModules(state.customModules || [], true);
+  navigationPreferences = normalizeNavigationPreferences(result.navigationPreferences);
+  if (currentView === 'settings' && draft && dirty) {
+    settingsDraft = {
+      moduleOrder: draft.moduleOrder.filter((id) => MODULE_IDS.includes(id)),
+      placementByModule: Object.fromEntries(Object.entries(draft.placementByModule).filter(([id]) => MODULE_IDS.includes(id))),
+    };
+    for (const id of navigationPreferences.moduleOrder) {
+      if (!settingsDraft.moduleOrder.includes(id)) settingsDraft.moduleOrder.push(id);
+      if (!settingsDraft.placementByModule[id]) settingsDraft.placementByModule[id] = navigationPreferences.placementByModule[id];
+    }
+    settingsBaseRevision = navigationPreferences.revision;
+    settingsDirty = settingsDraftChanged();
+  } else if (currentView === 'settings') initSettingsDraft();
+  if (currentView && currentView !== 'settings' && currentView !== 'drawingManager' && !isModuleView(currentView)) {
+    currentView = resolveWorkspaceView(currentWorkspace, navigationPreferences.lastViewByWorkspace[currentWorkspace]);
+  }
+  if (settingsReturn?.view && !isModuleView(settingsReturn.view)) settingsReturn.view = null;
+  if (!state.plans.some((item) => item.id === selectedPlanId)) selectedPlanId = state.plans[0]?.id || null;
+  if (!state.templates.some((item) => item.id === selectedTemplateId)) selectedTemplateId = state.templates[0]?.id || null;
+  if (!state.problems.some((item) => item.id === selectedProblemId)) selectedProblemId = state.problems[0]?.id || null;
+  if (!state.thoughtEntries.some((item) => item.id === selectedThoughtId)) selectedThoughtId = null;
+  for (const moduleId of Object.keys(LIBRARY_MODULES)) {
+    const runtime = libraryState(moduleId);
+    if (!libraryTemplates(moduleId).some((item) => item.id === runtime.selectedId)) runtime.selectedId = libraryTemplates(moduleId)[0]?.id || null;
+  }
 }
 
 async function init() {
@@ -2979,6 +4765,7 @@ async function init() {
     const [result, backupResult] = await Promise.all([api('GET', '/api/state'), api('GET', '/api/backups')]);
     state = {
       version: result.version || 0,
+      customModules: result.customModules || [],
       sections: result.sections || [],
       records: result.records || {},
       checkinReasons: result.checkinReasons || {},
@@ -2989,17 +4776,43 @@ async function init() {
       plans: result.plans || [],
       templates: result.templates || [],
       problems: result.problems || [],
+      planCategories: result.planCategories || [],
+      templateCategories: result.templateCategories || [],
+      problemCategories: result.problemCategories || [],
+      learningCategories: result.learningCategories || [],
+      learningTemplates: result.learningTemplates || [],
+      coreThoughtCategories: result.coreThoughtCategories || [],
+      coreThoughtTemplates: result.coreThoughtTemplates || [],
+      reviewTemplateCategories: result.reviewTemplateCategories || [],
+      reviewTemplates: result.reviewTemplates || [],
       events: result.events || [],
       eventCheckins: result.eventCheckins || {},
-      eventExceptions: result.eventExceptions || [],
+      eventExceptions: result.eventExceptions || {},
       backups: backupResult.backups || [],
     };
+    // 启动恢复最近打开的界面与有效模块；无配置时进入 main/events
+    dataEpoch = result.dataEpoch;
+    trashedModuleIds = result.trashedModuleIds || [];
+    await LifeDrawings.load();
+    installCustomModules(result.customModules || [], true);
+    navigationPreferences = normalizeNavigationPreferences(result.navigationPreferences);
+    currentWorkspace = navigationPreferences.lastWorkspace === 'zone' ? 'zone' : 'main';
+    currentView = resolveWorkspaceView(currentWorkspace, navigationPreferences.lastViewByWorkspace[currentWorkspace]);
+    if (currentView === 'thoughts') resetThoughtsSurface();
     selectedPlanId = state.plans[0]?.id || null;
     selectedTemplateId = state.templates[0]?.id || null;
     selectedProblemId = state.problems[0]?.id || null;
+    for (const moduleId of Object.keys(LIBRARY_MODULES)) {
+      libraryState(moduleId).selectedId = libraryTemplates(moduleId)[0]?.id || null;
+    }
     const localNote = $('#localNoteText');
     if (localNote && result.appVersion) localNote.textContent = `数据仅保存在本地 · v${result.appVersion}`;
     render();
+    const startupDrawing = new URLSearchParams(location.search).get('drawing');
+    if (startupDrawing) {
+      const library = new URLSearchParams(location.hash.slice(1)).get('addLibrary');
+      await LifeDrawings.open(startupDrawing, '', library ? 'edit' : 'view', library || '');
+    }
   } catch (error) {
     $('#app').innerHTML = emptyState('triangle-alert', '数据加载失败', error.message, '<button class="button ghost" onclick="location.reload()">重新加载</button>');
     renderIcons();
