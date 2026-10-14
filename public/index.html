@@ -19,28 +19,26 @@
         </span>
       </div>
 
-      <nav class="primary-nav" id="primaryNav">
-        <button class="nav-item active" data-view="events"><i data-lucide="calendar-check"></i><span>重要时间点</span></button>
-        <button class="nav-item" data-view="principles"><i data-lucide="circle-play"></i><span>原则打卡</span></button>
-        <button class="nav-item" data-view="problems"><i data-lucide="folder-tree"></i><span>问题拆解</span></button>
-        <button class="nav-item" data-view="thoughts"><i data-lucide="message-circle"></i><span>所思</span></button>
-        <button class="nav-item" data-view="plans"><i data-lucide="calendar-days"></i><span>计划</span></button>
-        <button class="nav-item" data-view="templates"><i data-lucide="layout-template"></i><span>个人模板</span></button>
-      </nav>
+      <button class="workspace-switch" id="workspaceSwitch" data-action="switch-workspace" aria-label="进入专区"></button>
+
+      <nav class="primary-nav" id="primaryNav" aria-label="主导航"></nav>
 
       <div class="sidebar-bottom">
-        <button class="nav-item" data-view="principles" data-open-tab="manage"><i data-lucide="settings"></i><span>设置</span></button>
+        <button class="nav-item" data-view="drawingManager"><i data-lucide="panels-top-left"></i><span>画布管理</span></button>
+        <button class="nav-item" data-view="settings"><i data-lucide="settings"></i><span>设置</span></button>
         <div class="local-note"><span class="status-dot"></span><span id="localNoteText">数据仅保存在本地</span></div>
       </div>
     </aside>
 
     <section class="workspace">
+      <div id="drawingTabs" class="drawing-tabs" role="tablist" aria-label="悬挂画布" hidden></div>
       <header class="topbar" id="topbar"></header>
       <main id="app" tabindex="-1"></main>
     </section>
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="data-reload-notice" id="dataReloadNotice" role="alert" hidden>数据已变化，请先保留未保存文字。<button class="button ghost small" type="button">确认重新载入</button></div>
   <div class="event-drawer-backdrop hidden" id="eventDrawerRoot"></div>
   <div class="modal-backdrop hidden" id="modalBackdrop">
     <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
@@ -61,9 +59,17 @@
     <div class="review-viewer-stage" id="reviewViewerStage"><img id="reviewViewerImage" alt="复盘配图" /><p id="reviewViewerError" hidden>图片无法读取，请检查本地图片文件。</p></div>
     <div class="review-viewer-footer"><button class="icon-button" data-action="review-prev-image" aria-label="上一张"><i data-lucide="chevron-left"></i></button><p id="reviewViewerCaption"></p><button class="icon-button" data-action="review-next-image" aria-label="下一张"><i data-lucide="chevron-right"></i></button></div>
   </dialog>
+  <dialog class="review-image-viewer rich-image-viewer" id="richImageViewer" aria-label="内容图片查看器">
+    <div class="review-viewer-bar"><span>内容图片</span><div><button class="button ghost small" data-action="rich-viewer-zoom">适应屏幕</button><button class="icon-button" data-action="rich-close-viewer" aria-label="关闭大图"><i data-lucide="x"></i></button></div></div>
+    <div class="review-viewer-stage" id="richViewerStage"><img id="richViewerImage" alt="内容配图" /><p id="richViewerError" hidden>图片无法读取，请检查本地图片文件。</p></div><div class="review-viewer-footer"><p id="richViewerCaption"></p></div>
+  </dialog>
   <script src="/vendor/lucide.min.js"></script>
   <script src="/event-model.js"></script>
   <script src="/review-editor.js"></script>
+  <script src="/rich-editor.js"></script>
+  <script src="/custom-module-model.js"></script>
+  <script src="/drawing-host.js"></script>
+  <script src="/drawing-manager-ui.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
