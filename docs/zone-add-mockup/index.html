@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light" />
+  <title>生活管家 · 新增专区效果图</title>
+  <link rel="stylesheet" href="/public/style.css" />
+  <style>
+    html, body { height: 100%; overflow: hidden; background: #e7eeeb; }
+    .desktop { height: 100vh; display: flex; flex-direction: column; background: var(--bg); }
+    .titlebar {
+      height: 32px; flex: 0 0 32px; display: flex; align-items: center; justify-content: space-between;
+      padding-left: 12px; background: #f4f7f6; border-bottom: 1px solid var(--line); user-select: none;
+    }
+    .titlebar-brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; font-weight: 650; }
+    .titlebar-brand img { width: 16px; height: 16px; object-fit: contain; }
+    .win-controls { display: flex; height: 32px; }
+    .win-controls span { width: 46px; display: grid; place-items: center; color: #44505f; }
+    .win-controls svg { width: 11px; height: 11px; }
+    .desktop .app-shell { height: auto; flex: 1; min-height: 0; }
+    .desktop .sidebar, .desktop .workspace { height: 100%; min-height: 0; }
+
+    .zone-switch { margin-top: 18px; display: grid; gap: 2px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .zone-item, .zone-add {
+      width: 100%; min-height: 42px; border: 0; background: transparent; border-radius: 10px;
+      padding: 0 12px; display: flex; align-items: center; gap: 10px; cursor: pointer;
+      color: #3e4a5b; font-size: 14px; font-weight: 650; text-align: left;
+    }
+    .zone-item svg, .zone-add svg { width: 17px; height: 17px; flex: 0 0 auto; stroke-width: 1.8; }
+    .zone-item.active { color: var(--jade-dark); background: var(--surface-active); font-weight: 750; }
+    .zone-add { color: var(--jade-dark); font-weight: 750; }
+    .desktop .primary-nav { margin-top: 12px; }
+
+    .mock-editor .plan-note { min-height: 148px; }
+    .mock-editor .plan-next-step { min-height: 132px; }
+    .mock-editor .plan-workspace-panel { padding: 28px 32px 32px; }
+    .mock-editor .plan-field + .plan-field { margin-top: 22px; }
+    .mock-editor .plan-title-row { margin-bottom: 22px; }
+    .mock-editor.learning-page { padding-bottom: 28px; }
+
+    .scene-settings .content-page { padding: 14px 36px 12px; }
+    .scene-settings .settings-page { max-width: 920px; }
+    .scene-settings .settings-card { padding: 14px 18px 8px; }
+    .scene-settings .settings-head h2 { font-size: 18px; }
+    .scene-settings .settings-head p { margin-top: 2px; }
+    .scene-settings .settings-rows { margin-top: 4px; }
+    .scene-settings .settings-row { min-height: 42px; padding: 0 4px; gap: 10px; }
+    .scene-settings .mini-button { min-height: 36px; min-width: 36px; }
+    .scene-settings .settings-foot { margin-top: 6px; padding-top: 8px; }
+    .scene-settings .trash-card, .scene-settings .settings-links { display: none; }
+    .zone-card { margin-bottom: 12px; }
+    .zone-rows { margin-top: 8px; }
+    .zone-row {
+      display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 12px; align-items: center;
+      min-height: 42px; padding: 0 8px; border-radius: 10px;
+    }
+    .zone-row + .zone-row { border-top: 1px solid var(--line); }
+    .zone-fixed { color: var(--ink-faint); font-size: 13px; font-weight: 650; padding-right: 8px; }
+
+    .placement-select { position: relative; }
+    .placement-select-btn {
+      min-height: 36px; min-width: 128px; padding: 0 10px 0 12px; border: 1px solid var(--line);
+      border-radius: 10px; background: var(--surface-soft); display: inline-flex; align-items: center;
+      justify-content: space-between; gap: 8px; color: var(--ink); font-size: 13px; font-weight: 650; cursor: pointer;
+    }
+    .placement-select-btn svg { width: 15px; height: 15px; color: var(--ink-soft); }
+    .placement-select-btn.open { border-color: var(--jade); background: var(--surface-active); color: var(--jade-dark); }
+    .placement-select-btn.open svg { color: var(--jade-dark); }
+    .placement-menu {
+      position: absolute; z-index: 6; right: 0; top: calc(100% + 4px); min-width: 168px; padding: 5px;
+      background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); display: grid; gap: 2px;
+    }
+    .placement-option {
+      min-height: 40px; border: 0; border-radius: 8px; background: transparent; padding: 0 12px;
+      display: flex; align-items: center; cursor: pointer; font-size: 14px; text-align: left; color: var(--ink);
+    }
+    .placement-option.active { background: var(--surface-active); color: var(--jade-dark); font-weight: 750; }
+    .scene-settings .settings-foot-gap { margin-top: 136px; padding-top: 0; border-top: 0; }
+    .button.danger-fill { color: #fff; background: var(--danger); border-color: transparent; }
+    .button.danger-fill:hover { background: #b34343; }
+  </style>
+</head>
+<body>
+  <div class="desktop" id="desktop"></div>
+  <script src="/public/vendor/lucide.min.js"></script>
+  <script>
+    const MAIN_MODULES = [
+      ['events', '重要时间点', 'calendar-check'],
+      ['principles', '原则打卡', 'circle-play'],
+      ['plans', '计划', 'calendar-days'],
+      ['thoughts', '所思', 'message-circle'],
+      ['templates', '个人模板', 'layout-template'],
+    ];
+    const ZONE_MODULES = [
+      ['problems', '问题拆解', 'folder-tree'],
+      ['learning', '学习专区', 'graduation-cap'],
+      ['reviewTemplates', '复盘', 'history'],
+    ];
+
+    function icon(name) { return `<i data-lucide="${name}"></i>`; }
+
+    function zoneSwitch(active, includeReading) {
+      const zones = [
+        ['main', '当前界面', 'house'],
+        ['zone', '专区', 'layout-grid'],
+      ];
+      if (includeReading) zones.push(['reading', '读书', 'book-open']);
+      return `<div class="zone-switch" aria-label="界面">
+        ${zones.map(([id, name, glyph]) => `<button class="zone-item ${id === active ? 'active' : ''}" type="button"><i data-lucide="${glyph}"></i><span>${name}</span></button>`).join('')}
+        <button class="zone-add" type="button"><i data-lucide="plus"></i><span>新增专区</span></button>
+      </div>`;
+    }
+
+    function nav(modules, active) {
+      return modules.map(([id, name, glyph]) => `<button class="nav-item ${id === active ? 'active' : ''}" type="button"><i data-lucide="${glyph}"></i><span>${name}</span></button>`).join('');
+    }
+
+    function shell({ activeZone, modules, activeModule, includeReading, settings, title, subtitle, main, modal }) {
+      return `<div class="titlebar">
+        <div class="titlebar-brand"><img src="/public/assets/sprout-logo.png" alt="" /><span>生活管家</span></div>
+        <div class="win-controls" aria-hidden="true">
+          <span><svg viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.2"/></svg></span>
+          <span><svg viewBox="0 0 12 12"><rect x="2.2" y="2.2" width="7.6" height="7.6" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></span>
+          <span><svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3L3 9" stroke="currentColor" stroke-width="1.2"/></svg></span>
+        </div>
+      </div>
+      <div class="app-shell">
+        <aside class="sidebar" aria-label="主导航">
+          <div class="brand">
+            <span class="brand-mark"><img src="/public/assets/sprout-logo.png" alt="" /></span>
+            <span class="brand-copy"><strong>生活管家</strong><small>知行合一，思维建设与管理</small></span>
+          </div>
+          ${zoneSwitch(activeZone, includeReading)}
+          <nav class="primary-nav" aria-label="模块">${nav(modules, activeModule)}</nav>
+          <div class="sidebar-bottom">
+            <button class="nav-item" type="button"><i data-lucide="panels-top-left"></i><span>画布管理</span></button>
+            <button class="nav-item ${settings ? 'active' : ''}" type="button"><i data-lucide="settings"></i><span>设置</span></button>
+            <div class="local-note"><span class="status-dot"></span><span>数据仅保存在本地 · v0.6.2</span></div>
+          </div>
+        </aside>
+        <section class="workspace">
+          <header class="topbar"><div class="topbar-title"><h1>${title}</h1><p>${subtitle}</p></div></header>
+          <main id="app">${main}</main>
+        </section>
+      </div>
+      ${modal || ''}`;
+    }
+
+    function more() {
+      return `<div class="plan-more-wrap"><button class="plan-more" type="button" aria-label="更多操作"><i data-lucide="more-horizontal"></i></button></div>`;
+    }
+
+    function templatePage() {
+      const items = [
+        ['每日记录', '记录当天重点、收获与安排', '记录', true],
+        ['每周总结', '回顾一周的事项和进展', '记录', false],
+        ['阅读笔记', '整理内容与自己的理解', '学习', false],
+        ['项目记录', '跟进目标、行动和结果', '项目', false],
+      ];
+      return `<section class="page content-page plans-page mock-editor">
+        <div class="learning-toolbar flat-toolbar">
+          <button class="button primary small" type="button">${icon('plus')}新建模板</button>
+          <button class="learning-filter-btn" type="button">${icon('folder')}<span>全部分类</span>${icon('chevron-down')}</button>
+          <button class="button teal small" type="button">${icon('plus')}新建分类</button>
+        </div>
+        <aside class="plan-rail" aria-label="全部模板">
+          <div class="plan-rail-head"><div class="plan-rail-title"><h2>全部模板</h2><span class="plan-count">4 个</span></div></div>
+          <div class="plan-list">
+            ${items.map(([name, preview, category, active]) => `<div class="plan-list-row ${active ? 'active' : ''}">
+              <button class="plan-select" type="button">
+                <span class="plan-name">${name}</span>
+                <span class="plan-preview">${preview}</span>
+                <span class="flat-category-label">${category}</span>
+              </button>
+              ${more()}
+            </div>`).join('')}
+          </div>
+        </aside>
+        <div class="plan-workspace">
+          <section class="plan-workspace-panel" aria-label="当前模板编辑器">
+            <div class="plan-title-row">
+              <input class="plan-name-input" value="每日记录" aria-label="模板名称" readonly />
+              <span class="plan-save">已保存</span>
+            </div>
+            <section class="plan-field">
+              <div class="plan-field-head"><label>模板内容</label></div>
+              <textarea class="plan-next-step" readonly>今日重点：
+完成事项：
+收获与想法：
+明日安排：</textarea>
+            </section>
+            <section class="plan-field">
+              <div class="plan-field-head"><label>使用备注</label></div>
+              <textarea class="plan-note" readonly>日期：2026-10-14
+
+今日重点：
+整理当天事项，留出时间完成重要任务。
+
+演示数据，不会写入正式记录。</textarea>
+            </section>
+          </section>
+        </div>
+      </section>`;
+    }
+
+    function emptyPage() {
+      return `<section class="page content-page"><div class="empty-state">
+        <div class="empty-icon">${icon('layout-grid')}</div>
+        <h3>还没有模块</h3>
+        <p>到设置里把模块分配到这个专区。</p>
+        <button class="button primary" type="button">${icon('settings')}前往设置</button>
+      </div></section>`;
+    }
+
+    function readingPage() {
+      const items = [
+        ['知行合一', '知道，就要做到。', true],
+        ['长期主义', '把时间花在会复利的事情上。', false],
+        ['每日一问', '今天哪一步是我自己能做的？', false],
+      ];
+      return `<section class="page content-page learning-page mock-editor">
+        <div class="learning-toolbar">
+          <button class="button primary small" type="button">${icon('plus')}新建模板</button>
+          <button class="learning-filter-btn" type="button">${icon('folder')}<span>全部分类</span>${icon('chevron-down')}</button>
+          <button class="button teal small" type="button">${icon('plus')}新建分类</button>
+        </div>
+        <div class="learning-body">
+          <aside class="plan-rail" aria-label="核心思想模板列表">
+            <div class="plan-rail-head"><div class="plan-rail-title"><h2>列表</h2><span class="plan-count">3 个</span></div></div>
+            <div class="learning-cards">
+              ${items.map(([name, preview, active]) => `<div class="plan-list-row learning-card ${active ? 'active' : ''}">
+                <button class="plan-select" type="button">
+                  <span class="plan-name">${name}</span>
+                  <span class="plan-preview">${preview}</span>
+                  <span class="learning-updated">更新于 10-14 09:20</span>
+                </button>
+                ${more()}
+              </div>`).join('')}
+              <button class="learning-card-add" type="button">${icon('plus')}新建模板</button>
+            </div>
+          </aside>
+          <div class="plan-workspace">
+            <section class="plan-workspace-panel">
+              <div class="plan-title-row">
+                <input class="plan-name-input" value="知行合一" aria-label="模板标题" readonly />
+                <span class="plan-save">已保存</span>
+              </div>
+              <section class="plan-field">
+                <div class="plan-field-head"><label>模板内容</label></div>
+                <textarea class="plan-next-step" readonly>知道，就要做到。
+想到的事，写成下一步。</textarea>
+              </section>
+              <section class="plan-field">
+                <div class="plan-field-head"><label>使用备注</label></div>
+                <textarea class="plan-note" readonly>演示数据，不会写入正式记录。
+用来提醒：想法要落到一个看得见的行动。</textarea>
+              </section>
+            </section>
+          </div>
+        </div>
+      </section>`;
+    }
+
+    function placement(value, open) {
+      const options = ['当前界面', '专区', '读书'];
+      return `<div class="placement-select">
+        <button class="placement-select-btn ${open ? 'open' : ''}" type="button" aria-expanded="${open ? 'true' : 'false'}">
+          <span>${value}</span>${icon('chevron-down')}
+        </button>
+        ${open ? `<div class="placement-menu" role="listbox">
+          ${options.map((name) => `<button class="placement-option ${name === value ? 'active' : ''}" type="button">${name}</button>`).join('')}
+        </div>` : ''}
+      </div>`;
+    }
+
+    function moduleRow(name, glyph, where, open) {
+      return `<div class="settings-row">
+        <button class="drag-handle" type="button" aria-label="拖动调整「${name}」的顺序">${icon('grip-vertical')}</button>
+        <span class="settings-module-icon">${icon(glyph)}</span>
+        <span class="settings-module-name">${name}</span>
+        ${placement(where, open)}
+        <div class="row-actions">
+          <button class="mini-button" type="button" aria-label="上移「${name}」">${icon('arrow-up')}</button>
+          <button class="mini-button" type="button" aria-label="下移「${name}」">${icon('arrow-down')}</button>
+        </div>
+      </div>`;
+    }
+
+    function settingsPage(showMenu = true) {
+      const rows = [
+        ['重要时间点', 'calendar-check', '当前界面'],
+        ['原则打卡', 'circle-play', '当前界面'],
+        ['问题拆解', 'folder-tree', '专区'],
+        ['计划', 'calendar-days', '当前界面'],
+        ['所思', 'message-circle', '当前界面'],
+        ['个人模板', 'layout-template', '当前界面'],
+        ['学习专区', 'graduation-cap', '专区'],
+        ['核心思想', 'lightbulb', '读书', showMenu],
+        ['复盘', 'history', '专区'],
+      ];
+      return `<section class="page content-page settings-page">
+        <section class="settings-card zone-card">
+          <div class="settings-head">
+            <h2>专区</h2>
+            <p>当前界面始终保留。专区可以重命名和删除；删除后，里面的模块会回到当前界面。新专区从侧栏的「新增专区」创建。</p>
+          </div>
+          <div class="zone-rows">
+            <div class="zone-row">
+              <span class="settings-module-icon">${icon('house')}</span>
+              <span class="settings-module-name">当前界面</span>
+              <span class="zone-fixed">固定</span>
+            </div>
+            <div class="zone-row">
+              <span class="settings-module-icon">${icon('layout-grid')}</span>
+              <span class="settings-module-name">专区</span>
+              <div class="row-actions">
+                <button class="mini-button" type="button" aria-label="重命名专区「专区」">${icon('pencil')}</button>
+                <button class="mini-button danger" type="button" aria-label="删除专区「专区」">${icon('trash-2')}</button>
+              </div>
+            </div>
+            <div class="zone-row">
+              <span class="settings-module-icon">${icon('book-open')}</span>
+              <span class="settings-module-name">读书</span>
+              <div class="row-actions">
+                <button class="mini-button" type="button" aria-label="重命名专区「读书」">${icon('pencil')}</button>
+                <button class="mini-button danger" type="button" aria-label="删除专区「读书」">${icon('trash-2')}</button>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section class="settings-card">
+          <div class="settings-head">
+            <div class="settings-heading-row"><h2>模块管理</h2><button class="button primary" type="button">${icon('plus')}新增模块</button></div>
+            <p>选择每个模块显示在当前界面，或哪一个专区。顺序在点击保存设置后生效。</p>
+          </div>
+          <div class="settings-rows">
+            ${rows.map(([name, glyph, where, open]) => moduleRow(name, glyph, where, open)).join('')}
+          </div>
+        </section>
+        <div class="settings-foot ${showMenu ? 'settings-foot-gap' : ''}">
+          <span class="settings-status">核心思想将显示在「读书」，尚未保存</span>
+          <div class="settings-actions">
+            <button class="button ghost" type="button">取消</button>
+            <button class="button primary" type="button">保存设置</button>
+          </div>
+        </div>
+      </section>`;
+    }
+
+    function createModal() {
+      const icons = [
+        ['book-open', '书本', true],
+        ['folder', '文件夹', false],
+        ['lightbulb', '灯泡', false],
+        ['target', '目标', false],
+        ['star', '星星', false],
+      ];
+      return `<div class="modal-backdrop">
+        <section class="modal custom-module-modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+          <div class="modal-head">
+            <div><p class="eyebrow">专区</p><h2 id="modalTitle">新增专区</h2></div>
+            <button class="icon-button" type="button" aria-label="关闭">${icon('x')}</button>
+          </div>
+          <div class="modal-body">
+            <p class="custom-module-intro">创建后是空白专区，到设置里把模块分配过来。</p>
+            <form>
+              <div class="field"><label for="zoneName">专区名称</label><input class="input" id="zoneName" value="读书" /></div>
+              <div class="field" style="margin-top:18px"><label for="zoneNote">一句说明</label><input class="input" id="zoneNote" value="阅读摘记和主题整理" /></div>
+              <fieldset class="custom-module-field"><legend>图标</legend><div class="custom-icon-options">
+                ${icons.map(([name, label, checked]) => `<label class="custom-icon-option" title="${label}"><input type="radio" name="zoneIcon" ${checked ? 'checked' : ''} aria-label="${label}"><span>${icon(name)}</span></label>`).join('')}
+              </div></fieldset>
+            </form>
+          </div>
+          <div class="modal-actions">
+            <div class="custom-module-footer"><small>名称会显示在侧栏列表里。</small><div>
+              <button class="button ghost" type="button">取消</button>
+              <button class="button primary" type="button">创建专区</button>
+            </div></div>
+          </div>
+        </section>
+      </div>`;
+    }
+
+    function deleteModal() {
+      return `<div class="modal-backdrop">
+        <section class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteTitle">
+          <div class="modal-head">
+            <div><p class="eyebrow">专区</p><h2 id="deleteTitle">删除专区</h2></div>
+            <button class="icon-button" type="button" aria-label="关闭">${icon('x')}</button>
+          </div>
+          <div class="modal-body"><p class="modal-message">删除「读书」后，里面的模块会回到当前界面。</p></div>
+          <div class="modal-actions">
+            <button class="button ghost" type="button">取消</button>
+            <button class="button danger-fill" type="button">删除专区</button>
+          </div>
+        </section>
+      </div>`;
+    }
+
+    const scenes = {
+      current() {
+        return shell({
+          activeZone: 'main', modules: MAIN_MODULES, activeModule: 'templates', includeReading: false,
+          title: '个人模板', subtitle: '把常用的内容整理成模板，需要时直接取用。', main: templatePage(),
+        });
+      },
+      create() {
+        return shell({
+          activeZone: 'main', modules: MAIN_MODULES, activeModule: 'templates', includeReading: false,
+          title: '个人模板', subtitle: '把常用的内容整理成模板，需要时直接取用。', main: templatePage(), modal: createModal(),
+        });
+      },
+      empty() {
+        return shell({
+          activeZone: 'reading', modules: [], activeModule: '', includeReading: true,
+          title: '读书', subtitle: '阅读摘记和主题整理', main: emptyPage(),
+        });
+      },
+      settings() {
+        document.body.classList.add('scene-settings');
+        return shell({
+          activeZone: 'main', modules: MAIN_MODULES, activeModule: '', includeReading: true, settings: true,
+          title: '设置', subtitle: '管理专区，以及模块的显示位置和排列顺序。', main: settingsPage(),
+        });
+      },
+      reading() {
+        return shell({
+          activeZone: 'reading', modules: [['coreThoughts', '核心思想', 'lightbulb']], activeModule: 'coreThoughts', includeReading: true,
+          title: '核心思想', subtitle: '按思想领域和主题分类管理你的核心思想模板。', main: readingPage(),
+        });
+      },
+      delete() {
+        document.body.classList.add('scene-settings');
+        return shell({
+          activeZone: 'main', modules: MAIN_MODULES, activeModule: '', includeReading: true, settings: true,
+          title: '设置', subtitle: '管理专区，以及模块的显示位置和排列顺序。', main: settingsPage(false), modal: deleteModal(),
+        });
+      },
+    };
+
+    function render() {
+      document.body.className = '';
+      const name = (location.hash || '#current').slice(1);
+      const draw = scenes[name] || scenes.current;
+      document.getElementById('desktop').innerHTML = draw();
+      if (window.lucide?.createIcons) window.lucide.createIcons({ attrs: { 'aria-hidden': 'true' } });
+    }
+    window.addEventListener('hashchange', render);
+    render();
+  </script>
+</body>
+</html>
